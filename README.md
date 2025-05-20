@@ -3,17 +3,18 @@ app_rtsp_sip.c is an [Asterisk](https://www.asterisk.org/) application tailored 
 
 `app_rtsp_sip` has updated the `app_rtsp` code to compile and run on Asterisk 17.x, PLUS it has added a simple SIP UA capability for setting up a SIP Session and subsequenlty sending RTP audio from the same Asterisk channel to the same camera.  In effect, an Asterisk calling entity can establish two-way audio with a surveillance camera. If only RTSP is needed, the `app_rtsp_sip` application can be setup in Asterisk to only use RTSP.
 
-In-line documentation was added to app_rtsp_sip.c so that one view its documentation at the Asterisk command line.
+In-line documentation was added to app_rtsp_sip.c so that one can view its documentation at the Asterisk command line.
 
 ## Restrictions/Limits/Quirks
-`app_rtsp_sip` has been developed and tested on a couple of Vivotek Cameras, as well as a Vivint Video Doorbell running Vivotek software that was configured for local use with Home Assistant.  It is possible that `app_rtsp_sip` may work with other cameras/devices but it is left up to the user of this software to determine how best to work with this code for such devices.
+- `app_rtsp_sip` has been developed and tested on a couple of Vivotek Cameras, as well as a Vivint Video Doorbell running Vivotek software that was configured for local use with Home Assistant.  It is possible that `app_rtsp_sip` may work with other cameras/devices but it is left up to the user of this software to determine how best to work with this code for such devices.
+- Digest authentication uses hashing code that may not work on certain cpu architectures possibly those running Big Endian (but not tested).
 
-The RTSP portion of the code originially developed by Sergiao Garcia Murillo and that has been ported to Asterisk 17.x has not been tested for the following:
+The RTSP portion of the code originially developed by Sergiao Garcia Murillo and that has been ported to Asterisk has not been tested for the following:
 - RTSP Video
 - IPv6
 - RTSP Tunnel
 - Use DTMF to stop RTSP
-- RTSP Digest Authentication. *This has been newly added as Vivotek uses Digest Authentication for SIP.  Vivotek by default uses Basic Authentication for RTSP which is what the original code supported. app_rtsp_sip update went ahead and added RTSP Digest authentication for RTSP too but not tested.*
+- RTSP Digest Authentication (code is incomplete). *Digest Authentication has been added for SIP as Vivotek uses Digest Authentication for SIP.  Vivotek by default uses Basic Authentication for RTSP which is what the original code supported.*
 
 # Asterisk
 
@@ -68,12 +69,9 @@ Do NOT do the `make install` yet.
 ## Integrating app_rtsp_sip into the build
 Assuming all went well with the Build, you can now copy the `app_rtsp_sip.c` file into the `../asterisk-17-<subversion>/apps/` directory with all the other app_xxx files.
 
-However, before we compile it, we need to run the `rtsp_sip_links.sh`.  The reason for the shell script is that app_rtsp_sip adds digest authentication and instead of re-inventing the wheel, it uses the digest authentication from the PJSIP project.  This requires the use of several pjproject include files which are scattered about under the pjproject directory and not available in the make files to application files.  This shell script simply adds symbolic links in the regular Asterisk include directory to all the needed pjsip/includes.
+- *For the Original version of app_rtsp_sip and Asterisk versions 17.x and 18.x* - If you are using the original version of app_rtsp_sip, you need to first run the `rtsp_sip_links.sh` before compiling.  The reason for the shell script is that app_rtsp_sip adds digest authentication and instead of re-inventing the wheel, it uses the digest authentication from the PJSIP project.  This requires the use of several pjproject include files which are scattered about under the pjproject directory and not available in the make files to application files.  This shell script simply adds symbolic links in the regular Asterisk include directory to all the needed pjsip/includes.
+ Copy the `rtsp_sip_links.sh` file into the `~/asterisk/asterisk.<subversion>/` directory, then run it: `$ sudo ./rtsp_sip_links.sh`.  app_rtsp_sip version 1.1 now incorporates its own digest authentication and the script is not used.
 
-Copy the `rtsp_sip_links.sh` file into the `~/asterisk/asterisk.<subversion>/` directory, then run it:
-```
-$ sudo ./rtsp_sip_links.sh
-```
 We can now compile app_rtsp_sip and create the necessary shared libraries used by Asterisk.
 Redo the make like we did before (2 in this example is the number of CPU cores):
 ```
@@ -229,6 +227,15 @@ contact = sip:2001@IP_ADDRESS:5060
 ```
 exten = 2001,1,Dial(PJSIP/2001)
 ```
+# Home Assistant Asterisk AddOn
+Home Assistant has a community AddOn that runs Asterisk and integrates well into the Home Assistant OS environment running as a Docker container.
+The app_rtsp_sip code has also been incorported into AddOn's build and has been used with other cameras. Information on the AddOn can be found here - [HA Asterisk AddOn](https://github.com/TECH7Fox/asterisk-hass-addons). 
 
+# History
+- version 1.1
+  - Updates to run on Asterisk 22.2.  Around Asterisk version 20.12.0, the pjsip routine that was used for Digest Authentication response stopped working.  This update uses its own Digest Authentication.
+  - There is a bug when using certain cameras that provide both a Digest and a Basic Authentication header for RTSP and the Basic Authentication is in the second header (second header is not supported).  A work-around compile option is made available to always do a Basic Authentication.  This particularly for use with the Home Assistant Asterisk AddOn.
+- version 1.0 Ported the original app_rtsp.c code to Asterisk version 17.x and add a SIP client to call the camera for setting up a audio channel to the camera.
 # Credits
 - Sergio Garcia Murillo, the author of the original app_rtsp.c code.
+

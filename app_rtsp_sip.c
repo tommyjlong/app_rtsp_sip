@@ -40,7 +40,7 @@
  * 
  * SIP is added for sending a one-way call to the same end device.
  *   The SIP protocol used is very simple and lite and completely self-contained within this module.
- *   (The exception is that it uses PJSIP's digest authentication). 
+ *   (The exception is that it uses custom digest authentication code located in an adjacent directory).
  *   There will be for sure various aspects of SIP not supported.  
  *
  * Documentation: in-line documentation is added.
@@ -56,10 +56,26 @@
  * 2) RTSP Digest Authentication (newly added).
  * 3) RTSP Tunnel
  * 4) Use DTMF to stop RTSP.
+ *
+ * [2025.5]
+ * Updated to to run with Asterisk version 22.2.0.
+ *   Around Asterisk version 20.12.0. pjsip auth code was refactored
+ *   and the Digest Authuorization used by this app no longer works.
+ * Now uses its own Digest Authentication code for MD5
+ *   which also uses Asterisk's md5 hash routine.
+ *   Currently only supports the simpler Digest Auth based on RFC2069.
+ *
+ * Development environment uses Home Assistant Asterisk AddOn (a Docker Container)
+ *   (See https://github.com/TECH7Fox/asterisk-hass-addons/)
+ *   Its Docker file has been modified in order to create
+ *   the development environment.
  */
 
 /* Use the following to test for Buffer length issues */
 /* #define TEST_BUFFER */
+
+/* [2025.5] Use the following to force Basic Auth for RTSP */
+/* #define FORCEBASIC_AUTH_RTSP */
 
 #include <asterisk.h>
 #include "asterisk/app.h" /* PORT 17.3 ADDed for parsing args */
@@ -72,7 +88,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <errno.h>
-#include <arpa/inet.h> /* NEW. needed for getsockname() */
+#include <arpa/inet.h> /* [17.x NEW]. needed for getsockname() */
 
 #include <asterisk/lock.h>
 #include <asterisk/file.h>
@@ -84,9 +100,14 @@
 #include <asterisk/translate.h>
 #include <asterisk/format_compatibility.h>
 
-/*  For use with pjsip digest authentication */
-#include <pjsua-lib/pjsua.h>
-#include <pj/string.h>
+
+/* 
+ * [2025.5] Now uses a custom digest authentication code
+ * which also uses Asterisk's ast_md5_hash() in utils.c.
+ * The include file for this ("asterisk/utils.h") has 
+ * already been included above 
+ */
+
 
 /*** DOCUMENTATION
 	<application name="RTSP-SIP" language="en_US">
@@ -157,7 +178,7 @@
  ***/
 
 
-/* NEW SIP: messaging sip:MY_NAME@blah_blah */
+/* [17.x NEW] SIP: messaging sip:MY_NAME@blah_blah */
 #define MY_NAME "agbell"
 
 
@@ -193,7 +214,7 @@ static const char app[] = "RTSP-SIP";
 #define RTSP_PLAYING		5
 #define RTSP_RELEASED 		6
 
-/* NEW SIP states */
+/* [17.x NEW] SIP states */
 #define SIP_STATE_NONE		0
 #define SIP_STATE_OPTIONS	1
 #define SIP_STATE_INVITE	2
@@ -439,7 +460,8 @@ static void MediaStatsRR(struct MediaStats *stats, struct Rtcp *rtcp)
 	rtcp->common.length = htons(7);
 }
 
-/* NEW. For SIP */
+
+/* [17.x NEW]. For SIP */
 enum SipMethodsIndex
 {
 	INVITE,  /* 0 */
@@ -485,7 +507,7 @@ struct RtspPlayer
 	struct 	MediaStats audioStats;
 	struct	MediaStats videoStats;
 
-        /* NEW. SIP */
+        /* [17.x NEW]. SIP */
 	char*   local_ctrl_ip; /* source IPv4 address string used by SIP */
 	uint16_t local_ctrl_port; /* source port used by SIP */
 	int	cseqm[MAX_METHODS]; /* SIP differentiates CSeq  by sequence number plus Method Sec 20.16 */
@@ -498,7 +520,7 @@ struct RtspPlayer
 	char    session_id[64];/* SDP for SIP sessionID */
 };
 
-/* NEW Digest Auth Data */
+/* [17.x NEW] Digest Auth Data */
 struct DigestAuthData
 {
 	char nonce[64];
@@ -510,21 +532,91 @@ struct DigestAuthData
 	char opaque[64];
 };
 
-/* NEW. For SIP */
+/*
+ * Custom code to provide Digest Authentication.
+ */
+static int auth_digest(char* username, \
+                 char* passwd, \
+                 char* realm, \
+                 char* nonce, \
+                 char* uri, \
+                 char* method, \
+                 char* digest_result) 
+{
+  
+  //char hash_result[64];
+    char hash_result[256];
+
+    /*
+     * Run a test to make sure MD5 hash is not broke
+     */
+    char* string_to_compare = "c3fcd3d76192e4007dfb496cca67e13b";
+    char* string_to_hash = "abcdefghijklmnopqrstuvwxyz";
+  //ast_md5_hash(char *output, const char *input)
+    ast_md5_hash(hash_result, string_to_hash);
+#ifdef PRINT_MD5HASH_TEST 
+    printf("Auth Digest Test Result should be: c3fcd3d76192e4007dfb496cca67e13b\n");
+    printf("Auth Digest Test Result actual   : %s\n", hash_result);
+#endif
+    if (strcmp(string_to_compare,hash_result)!=0){ /* are not equal */
+      //printf("Auth Digest Test failed\n"); 
+        return -1;
+    }
+  
+    /*
+     * Compute the Digest Response to a Digest Challenge
+     * using MD5 hash and an algorithm according to 
+     * RFC2069 (Digest Access Authentication for HTTP 1.0).
+     *
+     *     response-digest     =
+     *      <"> < KD ( H(A1), unquoted nonce-value ":" H(A2) > <">
+     *
+     *     A1             = unquoted username-value ":" unquoted realm-value
+     *                                            ":" password
+     *     password       = < user's password >
+     *     A2             = Method ":" digest-uri-value
+     *
+     *     where:
+     *        KD(secret, data) = H(concat(secret, ":", data))
+     *        For the "MD5" algorithm
+     *           H(data) = MD5(data)
+     *
+     */
+    char  A1[256];
+    char  A2[256];
+    char  HA1[256];
+    char  HA2[256];
+    char  KD_ARGS[513]; /* 512+'\0' */
+
+    sprintf(A1, "%s:%s:%s", username,realm,passwd);
+    ast_md5_hash(hash_result, A1);
+    sprintf(HA1,"%s", hash_result);
+  
+    sprintf(A2,"%s:%s", method, uri);
+    ast_md5_hash(hash_result, A2);
+  
+    sprintf(HA2,"%s", hash_result);
+    sprintf(KD_ARGS,"%s:%s:%s",HA1,nonce,HA2);
+    ast_md5_hash(digest_result, KD_ARGS);
+
+    return 0;
+}
+
+/* [17.x NEW]. For SIP */
 static int generateSrcTag(struct RtspPlayer *player)
 {
 	sprintf(player->src_tag,"%08lx", ast_random()); /* Set SIP source Tag */
 	return 1;
 }
 
-/* NEW. For SIP */
+/* [17.x NEW]. For SIP */
 static int generateBranch(struct RtspPlayer *player)
 {
 	sprintf(player->branch_id,"z9hG4bKi-%08lx%08lx%08lx%08lx",random(),random(),random(), random() );
 	return 1;
 }
 
-/* NEW. For SIP */
+/* [17.x NEW]. For SIP */
 static int generateCallId(struct RtspPlayer *player)
 {
 	if(player->local_ctrl_ip == NULL)
@@ -534,7 +626,7 @@ static int generateCallId(struct RtspPlayer *player)
 	return 1;
 }
 
-/* NEW. For SIP */
+/* [17.x NEW]. For SIP */
 static int generateSessionId(struct RtspPlayer *player)
 {
 	sprintf(player->session_id,"158%8ld",random()); /*SDP for SIP RFC3264 Sec 5 requires 64bits; we'll use 32bits */
@@ -629,24 +721,13 @@ static void RtspPlayerBasicAuthorization(struct RtspPlayer* player,char *usernam
 	sprintf(player->authorization, "Authorization: Basic %s",base64);
 }
 
-/* NEW. 
- * Use PJSIP to do Digest Authentication 
+/* [17.x NEW]. 
+ * Added Digest Authentication 
  */
 static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_username,\
 		char *cfg_password, char *cfg_realm, char *nonce, char *nc, \
 		char *cnonce, char *qop, char *uri, char* rx_realm, char *method, int isSIP)
 {
-	/* PJSIP Notes: 
-	 * 1.PJSIP only supports MD5 and AKAv1-MD5.  
-	 *   Here we assume "algorithm" is "MD5". Others such as SHA-256 are not supported.
-	 * 2.PJSIP appears to support:  qop none, or qop=auth, but not qop=auth-int.
-	 * 3.PJSIP requires any char string to have the following structure:
-	 *   typedef struct pj_str_t {
-	 *       char      *ptr;
-	 *       pj_size_t  slen;
-	 *   } pj_str_t;
-	 *   These strings are not null terminated, so when used outside of PJSIP, have to add termination.
-	 */
 
 	/* See if Received realm differs from Configured realm */
 	if (strcmp(cfg_realm,rx_realm)!=0){ /* are not equal */
@@ -658,42 +739,23 @@ static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_use
 
 	int  string_len = 0;
 
-	char digest_result[64];
-	pj_str_t pj_digest_result;
-	
-	pj_str_t pj_nonce;
-	pj_str_t pj_nc;
-	pj_str_t pj_cnonce;
-	pj_str_t pj_qop;
-	pj_str_t pj_uri;
-	pj_str_t pj_rx_realm;
-	pj_str_t pj_method;
-    
-	pj_digest_result = pj_str(digest_result);
-	pj_nonce     = pj_str(nonce);
-	pj_nc        = pj_str(nc);
-	pj_cnonce    = pj_str(cnonce);
-	pj_qop       = pj_str(qop);
-	pj_uri       = pj_str(uri);
-	pj_rx_realm  = pj_str(rx_realm);
-	pj_method    = pj_str(method);
-	
-	pjsip_cred_info cred_info;
+	char digest_result[256];
+        int result;
 
-	cred_info.realm = pj_str(cfg_realm);
-	cred_info.scheme = pj_str("digest");
-	cred_info.username = pj_str(cfg_username);
-     /* cred_info.data_type = PJSIP_CRED_DATA_DIGEST;*/
-	cred_info.data_type = PJSIP_CRED_DATA_PLAIN_PASSWD;
-	cred_info.data = pj_str(cfg_password);
+        /* [2025.5] change from PJSIP auth code to custom Digest auth code */
+        result=auth_digest(cfg_username, \
+              cfg_password, \
+              rx_realm, \
+              nonce, \
+              uri, \
+              method, \
+              digest_result);
 
-	pjsip_auth_create_digest(&pj_digest_result,&pj_nonce,&pj_nc,\
-			&pj_cnonce,&pj_qop,&pj_uri,\
-			&pj_rx_realm, &cred_info, &pj_method);
-
-
-	digest_result[pj_digest_result.slen]='\0'; /*Need to NULL terminate the string */
 	ast_debug(3,"Digest Result: %s\n",digest_result);
+
+	if ( result == -1) {
+		ast_log(LOG_ERROR,"MD5 hash computation test failed! Not tested on Big Endian\n");
+	}
 
 	if(isSIP){
 		/* 
@@ -722,7 +784,7 @@ static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_use
             
 	}
 	else{  /* RTSP NOT BEEN TESTED FOR DIGEST AUTH */
-		sprintf(player->authorization, "Authorization: Digest %s",pj_digest_result.ptr);
+		sprintf(player->authorization, "Authorization: Digest %s",digest_result);
 		ast_log(LOG_WARNING,"RTSP not tested for Digest Authentication.\n");
 	}
 	ast_debug(3,"Auth: \n%s\n",player->authorization);
@@ -1216,7 +1278,7 @@ static int RtspPlayerDescribe(struct RtspPlayer *player,const char *url)
 }
 
 
-/* NEW For SIP */ 
+/* [17.x NEW] For SIP */ 
 static void SipSpeakerSetAudioTransport(struct RtspPlayer *player, int dst_port)
 {
 	/* Setup struct for Dest address port */
@@ -1236,7 +1298,7 @@ static void SipSpeakerSetAudioTransport(struct RtspPlayer *player, int dst_port)
 
 }
 
-/* NEW For SIP */ 
+/* [17.x NEW] For SIP */ 
 static int SipSpeakerOptions(struct RtspPlayer *player, char *username)
 {
 	char request[1024];
@@ -1294,7 +1356,7 @@ static int SipSpeakerOptions(struct RtspPlayer *player, char *username)
 	return 1;
 }
 
-/* NEW For SIP */ 
+/* [17.x NEW] For SIP */ 
 static int SipSpeakerInvite(struct RtspPlayer *player, char *username, int audioFormat,int retry)
 {
 	char request[1024];
@@ -1432,7 +1494,7 @@ static int SipSpeakerAck(struct RtspPlayer *player, char *username, int response
 	{
 		/* Sect 13.2.2.4 
 		 * CSeq: ACKing Invite- Must be that of the INVITE being ACK'd. (Let invite code set correctly)
-		 * Auth: ACKing Invite- Must have same credentials as the INVITE. Note: PJSIP sends no Auth.
+		 * Auth: ACKing Invite- Must have same credentials as the INVITE. 
 		 * Offer: If received and not acceptable, generate a valid answer.
 		 * Sec 8.1.1.x
 		 * Call-ID: Same for all requests in dialog
@@ -1480,7 +1542,7 @@ static int SipSpeakerAck(struct RtspPlayer *player, char *username, int response
 	return 1;
 }
 
-/* NEW. SIP */
+/* [17.x NEW]. SIP */
 static int SipSpeakerBye(struct RtspPlayer *player, char *username )
 {
 	int temp;
@@ -1730,7 +1792,7 @@ struct SDPMedia
 	int 		   num;
      /*	int 		   all; OLD */
 	uint64_t 	   all; 		/* PORT 17.3 bit list of AST_FORMAT_xxx is ULL */
-	uint16_t	   peer_media_port; 	/* NEW. SIP Peers tcp/udp port for receiving media */
+	uint16_t	   peer_media_port; 	/* [17.x NEW]. SIP Peers tcp/udp port for receiving media */
 };
 
 struct SDPContent
@@ -2105,7 +2167,7 @@ static int CheckHeaderValue(char *buffer,int bufferLen,char *header,char*value)
 	return (strncasecmp(buffer+i,value,strlen(value))==0);
 }
 
-/* NEW for Digest Authentication */
+/* [17.x NEW] for Digest Authentication */
 static int GetAuthHeaderData(struct RtspPlayer *player, char *buffer,int bufferLen ,struct DigestAuthData *digest_data)
 {
 	char *www_header;
@@ -2133,7 +2195,10 @@ static int GetAuthHeaderData(struct RtspPlayer *player, char *buffer,int bufferL
 				digest_data->rx_realm[j-i] = *j; 
 				j++;
 			}
-			digest_data->rx_realm[j-i-1]='\0'; /* rewind 1; change last '"' to a termination */
+                        /* [2025.5] Asteriisk compiler complains when -1 is rightmost in an array */
+                        //digest_data->rx_realm[j-i-1]='\0'; /* rewind 1; change last '"' to a termination */      
+                        digest_data->rx_realm[j-1-i]='\0'; /* rewind 1; change last '"' to a termination */
+
 			ast_debug(3,"-rx_realm=%s\n",digest_data->rx_realm);
 		}
 		/* Get "nonce=" value within WWW-Authenticate: header. Note: value will be in quotes*/
@@ -2159,7 +2224,7 @@ static int GetAuthHeaderData(struct RtspPlayer *player, char *buffer,int bufferL
 	return 1;
 }
 
-/* NEW For SIP */ 
+/* [17.x NEW] For SIP */ 
 static int SipSetPeerTag(struct RtspPlayer *player, char *buffer,int bufferLen)
 {
 	char *to_header;
@@ -2195,7 +2260,7 @@ static int SipSetPeerTag(struct RtspPlayer *player, char *buffer,int bufferLen)
 	return 1;
 }
 
-/* NEW SIP */
+/* [17.x NEW] SIP */
 static int SipSpeakerReply(struct RtspPlayer *player, char *buffer, int bufferLen,\
                           char *username, const char *peer_ip, int peer_port, char *request)
 { 
@@ -2746,10 +2811,22 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 						} else {
 							/* Error */
 							ast_log(LOG_ERROR,"-No Authenticate header found\n");	
+#ifdef FORCEBASIC_AUTH_RTSP
+/* 
+ * 2025.5 temp workaround. 
+ * There is a bug where some cameras send Basic auth in a second Auth header
+ * which isn't supported causing this error, so force Basic Auth anyway.
+ */
+							ast_log(LOG_WARNING,"Forcing Basic Auth anyway\n");	
+							RtspPlayerBasicAuthorization(player,username,password);
+							RtspPlayerDescribe(player,url);
+							break;
+#else
 							/* End */
 							player->end = 1;
 							/* Exit */
 							break;
+#endif
 						}
 					}
 
@@ -4016,7 +4093,7 @@ static int app_rtsp_sip(struct ast_channel *chan, const char *data) /* PORT 17.3
 	int sip_port;
 
 
-	/* NEW. 
+	/* [17.x NEW]. 
 	 * Get arguments instead via macros. See example: app_dial.c 
 	 * Note: app.h says to use ast_app_separate_args()
 	 * but app_dial.c didn't, so won't here either.
@@ -4037,7 +4114,7 @@ static int app_rtsp_sip(struct ast_channel *chan, const char *data) /* PORT 17.3
 
 	ast_debug(3,"ARGs: RTSP URI %s. SIP Realm %s SIP Listen Port %s\n",args.rtsp_uri,args.sip_realm,args.sip_port); /*tjl*/
 
-	/* NEW. See if there are any args for sip realm */
+	/* [17.x NEW]. See if there are any args for sip realm */
 	if(!args.sip_realm)
 		sip_enable = 0; 
 	else
@@ -4048,7 +4125,7 @@ static int app_rtsp_sip(struct ast_channel *chan, const char *data) /* PORT 17.3
 	else
 		sip_realm = args.sip_realm;
 
-	/* NEW. See if there are any args for sip port */
+	/* [17.x NEW]. See if there are any args for sip port */
 	if(!args.sip_port)
 		args.sip_port = "5060"; 
 
