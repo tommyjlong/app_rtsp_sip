@@ -69,7 +69,7 @@ Do NOT do the `make install` yet.
 ## Integrating app_rtsp_sip into the build
 Assuming all went well with the Build, you can now copy the `app_rtsp_sip.c` file into the `../asterisk-17-<subversion>/apps/` directory with all the other app_xxx files.
 
-- *For the Original version of app_rtsp_sip and Asterisk versions 17.x and 18.x* - If you are using the original version of app_rtsp_sip, you need to first run the `rtsp_sip_links.sh` before compiling.  The reason for the shell script is that app_rtsp_sip adds digest authentication and instead of re-inventing the wheel, it uses the digest authentication from the PJSIP project.  This requires the use of several pjproject include files which are scattered about under the pjproject directory and not available in the make files to application files.  This shell script simply adds symbolic links in the regular Asterisk include directory to all the needed pjsip/includes.
+- *For the Original version of app_rtsp_sip and Asterisk versions 17.x and 18.x which are also Release tagged as v1.0* - If you are using the original version of app_rtsp_sip, you need to first run the `rtsp_sip_links.sh` before compiling.  The reason for the shell script is that app_rtsp_sip adds digest authentication and instead of re-inventing the wheel, it uses the digest authentication from the PJSIP project.  This requires the use of several pjproject include files which are scattered about under the pjproject directory and not available in the make files to application files.  This shell script simply adds symbolic links in the regular Asterisk include directory to all the needed pjsip/includes.
  Copy the `rtsp_sip_links.sh` file into the `~/asterisk/asterisk.<subversion>/` directory, then run it: `$ sudo ./rtsp_sip_links.sh`.  app_rtsp_sip version 1.1 now incorporates its own digest authentication and the script is not used.
 
 We can now compile app_rtsp_sip and create the necessary shared libraries used by Asterisk.
@@ -229,13 +229,46 @@ exten = 2001,1,Dial(PJSIP/2001)
 ```
 # Home Assistant Asterisk AddOn
 Home Assistant has a community AddOn that runs Asterisk and integrates well into the Home Assistant OS environment running as a Docker container.
-The app_rtsp_sip code has also been incorported into AddOn's build and has been used with other cameras. Information on the AddOn can be found here - [HA Asterisk AddOn](https://github.com/TECH7Fox/asterisk-hass-addons). 
+The app_rtsp_sip code has also been incorported into the AddOn's build and has been used with other cameras. Information on the AddOn can be found here - [HA Asterisk AddOn](https://github.com/TECH7Fox/asterisk-hass-addons). 
 
+## Config Files
+As of this writting, the above config files can be used, but they are considered as "custom" config files and are stored in the AddOn's shared config folder under the `./custom/` directory.
+
+## Debugging
+The app_rtsp_sip code uses Asterisk's `ast_debug()` function to make debug specific calls to the logging facility.  
+1) Logging <br/>
+   The debug logs however don't necessarily show up in the AddOn's log output.  If they don't then a work-around can be performed by using a custom logger configuration file `./custom/logger.conf` as follows:
+```
+[general]
+
+[logfiles]
+console => verbose(1),notice,warning,error
+/media/full.txt => debug,notice,warning,error,verbose,dtmf,fax
+```
+The shared file `/media/` is accessible by Asterisk, so was chosen in this example as the location to store the log file (note: this file will grow over time, so eventually remove this custom config).
+
+2) Setting the Debug Level<br/>
+  The Debugger logs have various levels from none (0) to high level (1) to deeper levels (much more than 1).  To set these levels in the AddOn for app_rtsp_sip (and 0 levels for all others) execute this script in Home Assistant (note: you may have to modify the name of your Asterisk AddOn):
+```
+sequence:
+  - action: hassio.addon_stdin
+    data:
+      addon: b35499aa_asterisk
+      input: core set debug 0
+  - action: hassio.addon_stdin
+    data:
+      addon: b35499aa_asterisk
+      input: core set debug 5 app_rtsp_sip
+alias: Debug App RTSP SIP
+description: "Setup the debug logging levels for app_rtsp_sip"
+```
+Then place a call to the device using app_rtsp_sip.  The file `full.txt` should contain several DEBUG lines for app_rtsp_sip.
 # History
+- version 2.0
+  - Rewrote a new way for parsing RTSP/SIP messages, namely headers, and was written in particular for the WWW-Authenticate header so as to find Basic and Digest methods and their parameters regardless of whether such methods are listed in one WWW-Authenticate header or multiples.  This new parsing scheme is currently only applied to authentication.  
 - version 1.1
   - Updates to run on Asterisk 22.2.  Around Asterisk version 20.12.0, the pjsip routine that was used for Digest Authentication response stopped working.  This update uses its own Digest Authentication.
   - There is a bug when using certain cameras that provide both a Digest and a Basic Authentication header for RTSP and the Basic Authentication is in the second header (second header is not supported).  A work-around compile option is made available to always do a Basic Authentication.  This particularly for use with the Home Assistant Asterisk AddOn.
 - version 1.0 Ported the original app_rtsp.c code to Asterisk version 17.x and add a SIP client to call the camera for setting up a audio channel to the camera.
 # Credits
 - Sergio Garcia Murillo, the author of the original app_rtsp.c code.
-

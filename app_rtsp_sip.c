@@ -40,7 +40,6 @@
  * 
  * SIP is added for sending a one-way call to the same end device.
  *   The SIP protocol used is very simple and lite and completely self-contained within this module.
- *   (The exception is that it uses custom digest authentication code located in an adjacent directory).
  *   There will be for sure various aspects of SIP not supported.  
  *
  * Documentation: in-line documentation is added.
@@ -56,9 +55,10 @@
  * 2) RTSP Digest Authentication (newly added).
  * 3) RTSP Tunnel
  * 4) Use DTMF to stop RTSP.
+ * Tagged this as release [v1.0]
  *
- * [2025.5]
- * Updated to to run with Asterisk version 22.2.0.
+ * [v1.1]
+ * Updated to run with Asterisk version 22.2.0.
  *   Around Asterisk version 20.12.0. pjsip auth code was refactored
  *   and the Digest Authuorization used by this app no longer works.
  * Now uses its own Digest Authentication code for MD5
@@ -69,13 +69,24 @@
  *   (See https://github.com/TECH7Fox/asterisk-hass-addons/)
  *   Its Docker file has been modified in order to create
  *   the development environment.
+ *
+ * [v2.0] 
+ * The original code supported searching a RTSP/SIP message header-value
+ *    -only when the "header" was present once
+ *    -and the header contained only one "value".
+ * This is a problem for cameras that support multiple authentication methods
+ *   and the methods are spread across multiple headers.
+ *
+ * This version adds a new way of parsing RTSP/SIP messages, headers, and Auth params
+ * but this version of code only applies this new way
+ * to Authentication related RTSP/SIP messaging.
+ * This will support multiple Auth methods in same WWW-Authenticate header
+ * or across multiple WWW-Authenticate headers.
+ *
  */
 
 /* Use the following to test for Buffer length issues */
 /* #define TEST_BUFFER */
-
-/* [2025.5] Use the following to force Basic Auth for RTSP */
-/* #define FORCEBASIC_AUTH_RTSP */
 
 #include <asterisk.h>
 #include "asterisk/app.h" /* PORT 17.3 ADDed for parsing args */
@@ -102,7 +113,7 @@
 
 
 /* 
- * [2025.5] Now uses a custom digest authentication code
+ * [v1.1] Now uses a custom digest authentication code
  * which also uses Asterisk's ast_md5_hash() in utils.c.
  * The include file for this ("asterisk/utils.h") has 
  * already been included above 
@@ -177,6 +188,176 @@
 	</application>
  ***/
 
+/* [v2.0] Adders for new message/header/auth params parsing */
+#define MAX_HEADERS 100		//max number of header lines in an RTSP/SIP message
+#define MAX_HEADER_LINE 1024    //max size of a header line
+#define MAX_FIELD_NAME 1024     //max size of a header's field name; otherwise strncpy warns of trunc
+#define MAX_FIELD_VALUE 1024    //max size of a header's field value; otherwise strncpy warns of trunc
+
+#define MAX_TOKEN 512        //number of chars say in a name, a key, a value
+#define MAX_AUTH_KEY_VAL 20  //max num of an auth scheme's parameters as key/value pairs
+
+typedef struct {
+    char field_name[MAX_FIELD_NAME];
+    char field_value[MAX_FIELD_VALUE];
+} HeaderStruct;
+
+typedef struct {
+    HeaderStruct headers[MAX_HEADERS];
+    int count;
+} HeaderStructList;
+
+/*
+ * [v2.0] Simple routine that removes whitespaces from a string
+ * starting at the beginning moving forward and 
+ * then starting at the end and moving backwards.
+ */
+static void trim_whitespace(char *str) {
+    char *end;
+    // Trim leading space
+    while(isspace((unsigned char)*str)) str++;
+    // Trim trailing space
+    end = str + strlen(str) - 1;
+    while(end > str && isspace((unsigned char)*end)) end--;
+    *(end + 1) = 0;
+}
+
+/* 
+ * [v2.0]
+ * Parse raw buffer (string) containing an RTSP or SIP Message 
+ *   to get at the start of the list of Headers.
+ *   Return the location (as an arg) where the headers start.
+ *
+ * RFC7826 RSTP2.0 Sect. 20.2.2 RTSP Message
+ * RTSP-message      = Request / Response  ; RTSP/2.0 messages
+ * Request/Response  = Request-Line or Status-Line
+ *                     *((Header) CRLF) 
+ *                     CRLF
+ *                     [ message-body-data ]
+ * Request-Line = Method SP Request-URI SP RTSP-Version CRLF
+ * Status-Line  = RTSP-Version SP Status-Code SP Reason-Phrase CRLF
+ *
+ * RFC3261 SIP Messages Sect. 7 much the same.
+ *
+ * So Buffer may contain other stuff before the list of headers.
+ * Start at beginning (skipping over RTSP/SIP Request/Response)
+ *   looking for the first "CRLF", then headers (if any) should start.
+ *
+ */
+static int parse_message(char *buffer, char **headers_start) {
+    if ( (*headers_start = strstr(buffer, "\r\n")) == NULL)
+    {
+	ast_log(LOG_WARNING,"Parsing RTSP/SIP message: No Start Line found\n");
+        return -1;
+    }
+    else
+    {
+        *headers_start+=2;  //skip over CR LF
+      //printf("first header char is %c\n",**headers_start);
+    }
+    return 0;
+}
+
+/*
+ * [v2.0]
+ * Parse RTSP/SIP Headers (within raw string buffer) beginning at the 
+ *  location where the headers actually start.
+ *
+ * RFC7230 Definition of Header
+ *   header-field   = field-name ":" OWS field-value OWS
+ *
+ *   field-name     = token
+ *   field-value    = *( field-content / obs-fold )
+ *   field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
+ *   field-vchar    = VCHAR / obs-text
+ *
+ *   obs-fold       = CRLF 1*( SP / HTAB )
+ *                  ; obsolete line folding
+ */
+static int parse_headers(char *buffer, HeaderStructList *header_list) {
+    header_list->count = 0;
+    char *line_start = buffer;
+    char *fold_start;
+    char *line_end;
+    char line[MAX_HEADER_LINE];
+
+    while (*line_start && header_list->count < MAX_HEADERS) 
+    {
+        /*
+         * handle obsolete line folding where a Header line
+         * can be extended using CRLF 1*( SP / HTAB )
+         */
+        int  line_extended = 0;
+        fold_start = line_start;
+        do
+        {
+            line_end = strstr(fold_start, "\r\n");
+            if (!line_end) 
+            {
+                break; //Returned Null - Malformed header block
+            }
+            if( *(line_end+2) == ' '  || *(line_end+2) == '\t' )
+            {
+                line_extended=1;
+	        ast_debug(6,"  Header line %d is extended\n",header_list->count);
+                fold_start = line_end+2;
+            }
+            else
+            {
+                if( *(line_end+2) == '\r'  && *(line_end+3) == '\n' )
+                {
+                    //we're at CRLF after last header line.
+                    line_extended=0;
+	            ast_debug(6,"  Header line %d is NOT extended\n",header_list->count);
+	            ast_debug(6,"  End of Headers found. Processing last line\n");
+                }
+                else
+                {
+                    line_extended=0;
+	            ast_debug(6,"  Header line %d is NOT extended\n",header_list->count);
+                }
+            }
+        }
+        while( line_extended);
+
+        if (!line_end) 
+        {  
+	    ast_log(LOG_WARNING,"  Malformed Header (no CRLF).\n");
+            break; //Above returned Null looking for crlf - Malformed header block
+        }
+        size_t line_len = line_end - line_start;
+        if (line_len == 0)  //line_start and line_end both at CRLF after all headers
+        {
+	    ast_debug(6,"  Header Line %d has length of zero (so not a line)\n",header_list->count);
+            break; // Empty line = end of headers
+        }
+        if (line_len >= MAX_HEADER_LINE) {
+	    ast_log(LOG_WARNING,"  Header line too long\n");
+            return -1;
+        }
+
+        strncpy(line, line_start, line_len);
+        line[line_len] = '\0';
+
+        char *colon = strchr(line, ':');
+        if (!colon) {
+	    ast_log(LOG_WARNING,"Malformed header line (no colon): %s\n", line);
+            return -1;
+        }
+
+        *colon = '\0';
+        strncpy(header_list->headers[header_list->count].field_name, line, MAX_FIELD_NAME);
+        strncpy(header_list->headers[header_list->count].field_value, colon + 1, MAX_FIELD_VALUE);
+        trim_whitespace(header_list->headers[header_list->count].field_name);
+        trim_whitespace(header_list->headers[header_list->count].field_value);
+
+        header_list->count++;
+        line_start = line_end + 2; // Skip over \r\n
+    }
+
+    return 0;
+}
+
 
 /* [17.x NEW] SIP: messaging sip:MY_NAME@blah_blah */
 #define MY_NAME "agbell"
@@ -193,7 +374,7 @@
 #define AST_FORMAT_AMRNB	0
 #endif 
 
-/* PORT 17.3  AST_FORMAT_MPEG4 is now AST_FORMAT_MP4 (1LL << 22). The following longer needed. */
+/* PORT 17.3  AST_FORMAT_MPEG4 is now AST_FORMAT_MP4 (1LL << 22). The following is no longer needed. */
 /* #ifndef AST_FORMAT_MPEG4 OLD 
  * #define AST_FORMAT_MPEG4        (1 << 22) OLD 
  * #endif OLD
@@ -477,6 +658,14 @@ enum SipMethodsIndex
 	MAX_METHODS
 };
 
+/* 
+ * [17.x Changed]. 
+ * RTSP Player was orignally modelled as a stream player 
+ *   to get the camera to send streams to it.
+ * Add stuff so SIP will use a Player instance to model 
+ *   itself as a SIP Client.
+ *  
+ */
 struct RtspPlayer
 {
 	int	fd;
@@ -520,6 +709,191 @@ struct RtspPlayer
 	char    session_id[64];/* SDP for SIP sessionID */
 };
 
+
+/*
+ *   [v2.0] updates this code to better handle parsing of Authentication Headers and parameters.
+ *     Some specifications cited below:
+ *
+ *   RTSP 1.0 (RFC2326) via HTTP1.0 (RFC 2068) and
+ *   RTSP 2.0 (RFC7826) both say:
+ *   that the WWW-Authenticate field-value "might
+ *   contain more than one challenge", or that there may
+ *   may be "more than one WWW-Authenticate
+ *   header field is provided, the contents of a challenge itself can
+ *   contain a comma-separated list of authentication parameters".
+ *
+ *   This code is being updated to search for header-value accordingly.
+ *   [Remark] fixes issue in original code when a camera 
+ *     supports Digest in first header and Basic in second header, 
+ *     and searching for Basic failed because original code 
+ *     only looked in first header.
+ *
+ * Parsing Authentication Data
+ * RFC7826 (RTSP2.0)
+ *   RTSP Authentication is specified in HTTP1.1 Auth [RFC7235].
+ *   Its usage depends on the used authentication schemes, such as 
+ *   - Digest [RFC7616]
+ *     The value of the header field can include parameters list:
+ *     realm, domain, nonce, opaque, stale, algorithm, qop, charset, userhash
+ *   - Basic  [RFC7617]
+ *     o  The authentication parameter 'realm' is REQUIRED ([RFC7235], Section 2.2).
+ *     o  The authentication parameter 'charset' is OPTIONAL (see Section 2.1).
+ *     The only parameter supported in this code is 'realm'.
+ *   - The full list of Auth Schemes: 
+ *          https://www.iana.org/assignments/http-authschemes/http-authschemes.xhtml
+ *
+ * RFC7235 (HTTP1.1 Auth) 
+ *  Uses Augmented Backus-Naur Form (ABNF) defined in [RFC5234] 
+ *      with a list extension, defined in Section 7 of HTTP1.1 [RFC7230],
+ *   Two definitions in [RFC7235]: section 4.1, and Appendix C
+ *   WWW-Authenticate = 1#challenge  //ABNF Notation
+ *   WWW-Authenticate = *( "," OWS ) challenge *( OWS "," [ OWS challenge ] )
+ *     "*" <default=0>*<default=infinity>,so * means 0 to inifinity of, 
+ *         1* means at least 1 to infinity to, *1 means at least 0 to 1 of
+ *     '#' similar to "*" but the operator is a comma separated list. 1# means 1 to infinity of
+ *     "/" means OR
+ *     OWS = *( SP / HTAB ) from RFC7230 (also says "zero or more linear whitespace octets")
+ *         so contradiction as LWS in RFC5234 also includes CRLF. 
+ *     ()  Elements enclosed in parentheses are treated as a single element,
+ *         whose contents are strictly ordered
+ *     []  Square brackets enclose an optional element sequence: [foo bar] same as ( 0*1(foo bar) )
+ *
+ *     challenge   = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+ *     '1*SP' means at least one space (space = 0x20).
+ *     token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+ *     auth-param = token BWS "=" BWS ( token / quoted-string )
+ *     token = 1*tchar
+ *        tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*"
+ *               / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+ *               / DIGIT / ALPHA
+ *     BWS = OWS that shouldn't really be there but allowed for.
+ * 
+ */ 
+
+
+/*
+ * [v2.0] Parse for Authentication Scheme
+ * 
+ * This routine is very rudimentary in that it assumes
+ * the authentication scheme is at the beginning of the
+ * "input" string and ends with 1 or more SP.
+ * It then returns (as an arg) what should be the location of the start of the 
+ * authentication parameters for that scheme which
+ * should be after all the 1 or more SPs.
+ *
+ */
+static int parse_auth_scheme(char *input, char *scheme, char **rest) {
+    int i = 0;
+    while (input[i] && !isspace((unsigned char)input[i]) && i < MAX_TOKEN - 1) {
+        scheme[i] = input[i];
+        i++;
+    }
+    scheme[i] = '\0';
+
+    // Skip spaces after scheme
+    while (input[i] && isspace((unsigned char)input[i])) i++;
+
+    *rest = &input[i];
+    return 0;
+}
+
+/*
+ * [v2.0] For future use. 
+ *        An Auth scheme can use a token instead of parameters (key/value pairs)
+ * Try parsing/verifying presence of a token68
+ */
+static int is_token68(char *str) {
+    for (int i = 0; str[i]; i++) {
+        if (!isalnum((unsigned char)str[i]) && str[i] != '+' && str[i] != '/' && str[i] != '=')
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * [v2.0]  Parse Authentication Parameters into key/value pairs.
+ * 
+ * Given the start of a string containing one or more authentication parameters
+ * in a comma separated list (within a WWW-Authenticate header), find
+ * and separate into an array of "key" and an array of "value" where each
+ * array element is a pointer to a string for that key or value.
+ * Return these arrays (as args).
+ *
+ * A comma-separated list may continue on not with a parameter but
+ * instead with another Authentication Scheme (with its own parameters)
+ * which is denoted by lack of "=". So return (as an arg) 
+ * with the starting location of this additional Scheme (if none, return NULL).
+ * Note: Each key/value string is allocated from memory, so needs to be freed later.
+ * 
+ */
+static int parse_auth_params(char *str,char *param_key[], char *param_val[], int *param_count, char **more_auths) {
+    char key[MAX_TOKEN], value[MAX_TOKEN];
+    char *p = str;
+    int param_kv_count=0;
+
+  //*more_auths = '\0';
+    *more_auths = NULL;
+
+    while (*p) {
+        while (isspace((unsigned char)*p) || *p == ',') p++;  // OWS and comma
+
+        // Parse key
+        int i = 0;
+        while (*p && *p != '=' && *p !=' ' && i < MAX_TOKEN - 1 && *p != '\0') {  //Key could have BWS, but we won't support.
+            key[i++] = *p++;
+        }
+        key[i] = '\0';
+        param_key[param_kv_count] = ast_strdup(key);  //does a malloc
+        if (param_key[param_kv_count] == NULL)
+        {
+	    ast_log(LOG_ERROR,"ast_strdup param_key failure.\n");
+            return -1;
+        }
+      //printf("Key: %s ",key);
+        if (*p != '=') {
+          //printf("Key not followed by '='. May be finished or may be another auth-scheme.\n");
+            //Backup 
+          //printf("Removing last Key with length %li\n",strlen(key));
+            *more_auths = (p-strlen(key));
+            key[i-strlen(key)] = '\0';
+            break;
+        }
+        p++;  // skip '='
+
+        // Parse value
+        i = 0;
+        if (*p == '"') {
+            p++;  // skip opening quote
+            while (*p && i < MAX_TOKEN - 1) {
+                if (*p == '"' && *(p-1) != '\\'){  //if quote not escaped, then done
+                    break;
+                }
+                value[i++] = *p++;
+            }
+            if (*p == '"') p++;  // skip closing quote
+        } else {
+            while (*p && *p != ',' && i < MAX_TOKEN - 1) {
+                value[i++] = *p++;
+            }
+        }
+        value[i] = '\0';
+        param_val[param_kv_count] = ast_strdup(value); //does a malloc
+        if (param_val[param_kv_count] == NULL)
+        {
+	    ast_log(LOG_ERROR,"ast_strdup param_val failure.\n");
+            return -1;
+        }
+      //printf("Value: %s\n",value);
+      //printf("Auth-Param: %s = %s\n", key, value);
+
+        param_kv_count++;
+    }
+  //printf("Num of Auth Parm K-V pairs %i\n",param_kv_count);
+    *param_count = param_kv_count;
+    
+    return 0;
+}
+
 /* [17.x NEW] Digest Auth Data */
 struct DigestAuthData
 {
@@ -530,10 +904,265 @@ struct DigestAuthData
 	char uri[64];
 	char rx_realm[32];
 	char opaque[64];
+	char algorithm[64]; //[v2.0] adder
 };
 
+/* [v2.0] adder - Basic Auth Data */
+struct BasicAuthData
+{
+	char rx_realm[128];
+};
+
+
 /*
- * Custom code to provide Digest Authentication.
+ * [v2.0] Check for Presence of a Specific Authentication Scheme.
+ *
+ * Given a buffer string containing an entire RTSP/SIP message, 
+ * parse the message looking for one or more Authentication Schemes 
+ * (in a WWW-Authenticate header) until a match on a specific
+ * scheme is found, and then have that scheme parsed for its authentication parameters
+ * and then separate the parameters into an array of "key" and an array of "value" where each
+ * array element is a pointer to a string for that key or value.
+ * These arrays are returned (as args) along with a count. 
+ * Note: Each key/value string is allocated from memory, so needs to be freed later.
+ */
+static int CheckAuthScheme(char *buffer,int bufferLen, char *scheme_to_match, char *auth_paramkey[], char *auth_paramval[], int *auth_paramcount)
+{
+    char* headers_start;
+
+    char scheme[MAX_TOKEN];
+    char *paramkey[MAX_AUTH_KEY_VAL];
+    char *paramval[MAX_AUTH_KEY_VAL];
+    int  param_count;
+    int  i,j;
+    int return_code=-10;
+    char *auth_start;
+
+    char *rest;       /* rest of the string after Auth Scheme (which are the params) */
+    char *more_auths; /* Another Auth Scheme (and its params) found afterwards */
+
+    ast_debug(5,"    Checking Headers for Matching Auth Scheme.\n");
+    if( parse_message(buffer, &headers_start) )
+    {
+        ast_debug(5,"    Could not parse RTSP/SIP message\n");
+        return_code= -1;
+    }
+    else
+    {
+        HeaderStructList headers;
+    
+        if (parse_headers(headers_start, &headers) == 0) //returns with 2xarray of parsed header key,value pairs
+        {
+            ast_debug(5,"  ---Parsing Headers---\n");
+            for (i = 0; i < headers.count; ++i) {
+                ast_debug(5,"    %s = %s\n", headers.headers[i].field_name, headers.headers[i].field_value);
+                if(strstr(headers.headers[i].field_name,"WWW-Authenticate")!=NULL)
+                {
+                    ast_debug(5,"    Found a WWW-Authenticate Header\n" );
+
+                    auth_start = headers.headers[i].field_value;
+                    auth_start++;
+                    ast_debug(6,"      Auth start string:\n%s\n",auth_start);
+                    do {
+                        more_auths = NULL;
+                        parse_auth_scheme(auth_start, scheme, &rest);
+                        ast_debug(6,"    Found an Auth-Scheme: %s\n", scheme);
+                        if(strcmp(scheme, scheme_to_match) == 0)
+                        {
+                            ast_debug(5,"    Found matching Auth-Scheme: %s\n", scheme_to_match);
+                            return_code= 0;
+                        }         
+
+                        if (*rest == '\0') {
+                            ast_debug(5,"    No parameters or token68 found.\n");
+                            auth_paramkey[0] = ast_strdup("None"); //does a malloc
+                            auth_paramval[0] = ast_strdup("None"); //does a malloc
+                            *auth_paramcount=1;
+                        } else if (is_token68(rest)) {
+                            ast_debug(5,"  Token68: %s\n", rest);
+                            //Have not tested token68!!
+                            auth_paramkey[0] = ast_strdup("Token68"); //does a malloc
+                            auth_paramval[0] = ast_strdup(rest); //does a malloc
+                            *auth_paramcount=1;
+                        } else {
+                            ast_debug(5,"  ---Parsing Auth-Params---\n");
+                            if( parse_auth_params(rest,paramkey,paramval,&param_count, &more_auths) == 0)
+                            {
+                              //printf("Param Count: %d\n", param_count);
+                                for ( j = 0; j < param_count; j++) {
+                                    ast_debug(5,"  Paramkey[%d]: %s    Paramval[%d]: %s\n", j,paramkey[j], j, paramval[j]);
+                                    if( return_code == 0)
+                                    {
+                                        auth_paramkey[j] = ast_strdup(paramkey[j]); //does a malloc
+                                        auth_paramval[j] = ast_strdup(paramval[j]); //does a malloc
+                                        *auth_paramcount = param_count;
+                                    }
+                                    ast_free(paramkey[j]);
+                                    ast_free(paramval[j]);
+                                }
+                            }
+                            ast_debug(5,"  ---End Parsing Auth-Params---\n");
+                        }
+                        if (more_auths != NULL)
+                        {
+                            ast_debug(6,"  more auths after comma-sep list: %s\n",more_auths);
+                            auth_start = more_auths;
+                        }
+
+                    }
+                    while(more_auths != NULL);
+                }
+            }
+            ast_debug(5,"  ---End Parsing Headers---\n");
+
+        } else {
+	    ast_log(LOG_WARNING,"No RTSP/SIP headers found.\n");
+            return_code= -2;
+        }
+    }
+    return return_code;
+}
+
+/* 
+ * [v2.0] Check WWW-Authenticate Headers for Basic Authentication scheme and get/convert any parameters 
+ */
+static int GetAuthSchemeBasic(char *buffer,int bufferLen, struct BasicAuthData *basic_data)
+{
+    int return_code = -1;
+    char *auth_paramkey[MAX_AUTH_KEY_VAL];
+    char *auth_paramval[MAX_AUTH_KEY_VAL];
+    int auth_paramcount;
+    int pi; //auth parameter index
+
+    basic_data->rx_realm[0]='\0';
+
+    ast_debug(5,"\n");
+    ast_debug(5,"GetAuthSchemeBasic()\n");
+    if (CheckAuthScheme(buffer,bufferLen,"Basic", auth_paramkey, auth_paramval, &auth_paramcount) == 0 )
+    {
+        ast_debug(5,"    - GetAuthSchemeBasic: Found WWW-Authenticate Method of Basic\n");
+        return_code = 0;
+        if( auth_paramcount == 0)
+        {
+            ast_debug(5,"    GetAuthSchemeBasic: Did not to find any params for Basic authentication\n");
+        }
+        else
+        {
+            ast_debug(5,"  --- Auth Key/Value pairs/struct ---\n");
+            for ( pi = 0; pi < auth_paramcount; pi++) {
+	        ast_debug(5,"  AuthParamkey[%d]: %s, AuthParamval[%d]: %s\n", pi,auth_paramkey[pi], pi, auth_paramval[pi]);
+                if( strcmp(auth_paramkey[pi],"realm") == 0 )
+                {
+                    strcpy(basic_data->rx_realm, auth_paramval[pi]);
+	            ast_debug(5,"  basic_data->rx_realm: %s\n",basic_data->rx_realm);
+                } 
+                /* Always free the malloc for the Auth param key/value arrays.*/
+                ast_free(auth_paramkey[pi]);
+                ast_free(auth_paramval[pi]);
+            }
+            ast_debug(5,"  --- End Auth Key/Value pairs/struct ---\n");
+        }
+    }
+    ast_debug(5,"End of GetAuthSchemeBasic()\n");
+    return return_code;
+}
+
+/* 
+ * [v2.0] Check WWW-Authenticate Headers for Digest Authentication scheme and get/convert any parameters 
+ */
+static int GetAuthSchemeDigest(char *buffer,int bufferLen, struct DigestAuthData *digest_data)
+{
+    int return_code = -1;
+    char *auth_paramkey[MAX_AUTH_KEY_VAL];
+    char *auth_paramval[MAX_AUTH_KEY_VAL];
+    int auth_paramcount;
+    int pi; //auth parameter index
+
+    digest_data->nonce[0]='\0';
+    digest_data->nc[0]='\0';
+    digest_data->cnonce[0]='\0';
+    digest_data->qop[0]='\0';
+    digest_data->uri[0]='\0';
+    digest_data->rx_realm[0]='\0';
+    digest_data->opaque[0]='\0';
+    digest_data->algorithm[0]='\0';
+
+    ast_debug(5,"\n");
+    ast_debug(5,"GetAuthSchemeDigest()\n");
+    if (CheckAuthScheme(buffer,bufferLen,"Digest", auth_paramkey, auth_paramval, &auth_paramcount) == 0 )
+    {
+        ast_debug(5,"    - GetAuthSchemeDigest: Found WWW-Authenticate Method of Digest\n");
+        return_code = 0;
+        if( auth_paramcount == 0)
+        {
+            ast_debug(5,"    - GetAuthSchemeDigest: Did not to find any params for Digest authentication\n");
+        }
+        else
+        {
+            ast_debug(5,"    --- Auth Key/Value pairs/struct ---\n");
+            for ( pi = 0; pi < auth_paramcount; pi++) 
+            {
+	        ast_debug(5,"    AuthParamkey[%d]: %s, AuthParamval[%d]: %s\n", pi,auth_paramkey[pi], pi, auth_paramval[pi]);
+
+                if( strcmp(auth_paramkey[pi],"realm") == 0 )
+                {
+                    strcpy(digest_data->rx_realm, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->rx_realm: %s\n",digest_data->rx_realm);
+                } 
+                if( strcmp(auth_paramkey[pi],"nonce") == 0 )
+                {
+                    strcpy(digest_data->nonce, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->nonce: %s\n",digest_data->nonce);
+                } 
+                if( strcmp(auth_paramkey[pi],"nc") == 0 )
+                {
+                    strcpy(digest_data->nc, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->nc: %s\n",digest_data->nc);
+                } 
+                if( strcmp(auth_paramkey[pi],"cnonce") == 0 )
+                {
+                    strcpy(digest_data->cnonce, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->cnonce: %s\n",digest_data->cnonce);
+                } 
+                if( strcmp(auth_paramkey[pi],"qop") == 0 )
+                {
+                    strcpy(digest_data->qop, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->qop: %s\n",digest_data->qop);
+                } 
+                if( strcmp(auth_paramkey[pi],"uri") == 0 )
+                {
+                    strcpy(digest_data->uri, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->uri: %s\n",digest_data->uri);
+                } 
+                if( strcmp(auth_paramkey[pi],"opaque") == 0 )
+                {
+                    strcpy(digest_data->opaque, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->opaque: %s\n",digest_data->opaque);
+                } 
+                if( strcmp(auth_paramkey[pi],"algorithm") == 0 )
+                {
+                    strcpy(digest_data->algorithm, auth_paramval[pi]);
+	            ast_debug(5,"    digest_data->algorithm: %s\n",digest_data->algorithm);
+                } 
+                /* Always free the malloc for the Auth param key/value arrays.*/
+                ast_free(auth_paramkey[pi]);
+                ast_free(auth_paramval[pi]);
+            }
+            ast_debug(5,"    --- End Auth Key/Value pairs/struct ---\n");
+        }
+    }
+    ast_debug(5,"End of GetAuthSchemeDigest()\n");
+    return return_code;
+}
+
+
+/*
+ * [v1.1] Custom code for Digest Authentication.
+ * Computes the response parameters to a challenge for MD5
+ *
+ * Supports RFC2069 (Digest Access Authentication for HTTP 1.0).
+ *
+ *   Note: Uses Asterisk's ast_md5_hash() to compute the MD5 hash.
  */
 static int auth_digest(char* username, \
                  char* passwd, \
@@ -552,11 +1181,10 @@ static int auth_digest(char* username, \
      */
     char* string_to_compare = "c3fcd3d76192e4007dfb496cca67e13b";
     char* string_to_hash = "abcdefghijklmnopqrstuvwxyz";
-  //ast_md5_hash(char *output, const char *input)
     ast_md5_hash(hash_result, string_to_hash);
 #ifdef PRINT_MD5HASH_TEST 
-    printf("Auth Digest Test Result should be: c3fcd3d76192e4007dfb496cca67e13b\n");
-    printf("Auth Digest Test Result actual   : %s\n", hash_result);
+    ast_debug(6,"Auth Digest Test Result should be: c3fcd3d76192e4007dfb496cca67e13b\n");
+    ast_debug(6,"Auth Digest Test Result actual   : %s\n", hash_result);
 #endif
     if (strcmp(string_to_compare,hash_result)!=0){ /* are not equal */
       //printf("Auth Digest Test failed\n"); 
@@ -564,7 +1192,7 @@ static int auth_digest(char* username, \
     }
   
     /*
-     * Compute the Digest Response to a Digest Challenge
+     * Next, compute the digest response to a digest challenge
      * using MD5 hash and an algorithm according to 
      * RFC2069 (Digest Access Authentication for HTTP 1.0).
      *
@@ -742,7 +1370,7 @@ static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_use
 	char digest_result[256];
         int result;
 
-        /* [2025.5] change from PJSIP auth code to custom Digest auth code */
+        /* [v1.1] change from PJSIP auth code to custom Digest auth code */
         result=auth_digest(cfg_username, \
               cfg_password, \
               rx_realm, \
@@ -751,7 +1379,7 @@ static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_use
               method, \
               digest_result);
 
-	ast_debug(3,"Digest Result: %s\n",digest_result);
+	ast_debug(3,"      Player Digest Result: %s\n",digest_result);
 
 	if ( result == -1) {
 		ast_log(LOG_ERROR,"MD5 hash computation test failed! Not tested on Big Endian\n");
@@ -787,7 +1415,7 @@ static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_use
 		sprintf(player->authorization, "Authorization: Digest %s",digest_result);
 		ast_log(LOG_WARNING,"RTSP not tested for Digest Authentication.\n");
 	}
-	ast_debug(3,"Auth: \n%s\n",player->authorization);
+	ast_debug(3,"      Player Auth String: \n%s\n",player->authorization);
 	return 1;
 }
 
@@ -1206,7 +1834,7 @@ static int RtspPlayerOptions(struct RtspPlayer *player,const char *url)
 
         /* Log */
      /* ast_log(LOG_DEBUG,">RTSP OPTIONS [%s]\n",url); OLD */
-        ast_debug(1,">RTSP OPTIONS [%s]\n",url);
+        ast_debug(1,"<RTSP OPTIONS [%s]\n",url); //changed [v2.0]
 
         /* Prepare request */
         snprintf(request,1024,
@@ -1227,7 +1855,8 @@ static int RtspPlayerOptions(struct RtspPlayer *player,const char *url)
         player->cseq++;
 	/* Log */
      /* ast_log(LOG_DEBUG,"<RTSP OPTIONS [%s]\n",url); OLD */
-        ast_debug(1,"<RTSP OPTIONS [%s]\n",url);
+      //ast_debug(1,"<RTSP OPTIONS [%s]\n",url); //changed [v2.0]
+	ast_debug(3,"\n%s\n",request); //Added [v2.0]
         return 1;
 }
 
@@ -1238,7 +1867,7 @@ static int RtspPlayerDescribe(struct RtspPlayer *player,const char *url)
 
 	/* Log */
      /*	ast_log(LOG_DEBUG,">DESCRIBE [%s]\n",url); OLD */
-	ast_debug(1,">DESCRIBE [%s]\n",url);
+        ast_debug(1,"<DESCRIBE [%s]\n",url);
 
 	/* Prepare request */
 	snprintf(request,1024,
@@ -1261,6 +1890,7 @@ static int RtspPlayerDescribe(struct RtspPlayer *player,const char *url)
 	strcat(request,"\r\n");
 
 	/* Send request */
+	ast_debug(3,"\n%s\n",request); //Added [v2.0]
 	if (!SendRequest(player->fd,request,&player->end))
 		/* exit */
 		return 0;
@@ -1272,7 +1902,7 @@ static int RtspPlayerDescribe(struct RtspPlayer *player,const char *url)
 	/* Increase seq */
 	player->cseq++;
      /*	ast_log(LOG_DEBUG,"<DESCRIBE [%s]\n",url); OLD */
-	ast_debug(1,"<DESCRIBE [%s]\n",url);
+      //ast_debug(1,"<DESCRIBE [%s]\n",url); //changed [v2.0]
 	/* ok */
 	return 1;
 }
@@ -1306,7 +1936,7 @@ static int SipSpeakerOptions(struct RtspPlayer *player, char *username)
 
 	/* Log */
      /*	ast_log(LOG_DEBUG,">SIP OPTIONS [%s]\n",username); OLD */
-	ast_debug(1,">SIP OPTIONS [%s]\n",username);
+	ast_debug(1,"<SIP OPTIONS [%s]\n",username); //changed [v2.0]
 
 	if (!player->in_a_dialog)
 	{
@@ -1348,10 +1978,10 @@ static int SipSpeakerOptions(struct RtspPlayer *player, char *username)
 	/* Increase seq */
 	player->cseqm[OPTIONS]++;
         
-	ast_debug(3,"-Sending SIP Options\n%s",request);
+	ast_debug(3,"\n%s",request); //changed [v2.0]
 
      /*	ast_log(LOG_DEBUG,"<SIP OPTIONS [%s]\n",username); OLD */
-	ast_debug(1,"<SIP OPTIONS [%s]\n",username);
+      //ast_debug(1,"<SIP OPTIONS [%s]\n",username); //changed [v2.0]
 
 	return 1;
 }
@@ -1368,7 +1998,7 @@ static int SipSpeakerInvite(struct RtspPlayer *player, char *username, int audio
 	char rtp_pt_name[16];
 
 	/* Log */
-	ast_debug(1,">SIP INVITE [%s]\n",username);
+	ast_debug(1,"<SIP INVITE [%s]\n",username); //changed [v2.0]
 
 	/* Message Body: SDP . Do this first to compute Content-Length.*/
 	switch (audioFormat)
@@ -1452,7 +2082,7 @@ static int SipSpeakerInvite(struct RtspPlayer *player, char *username, int audio
 	/* Message Header + Body */
 	sprintf(request+req_string_len,"%s",sdp);
 
-	ast_debug(3,"-Sending SIP Invite: \n%s",request);
+	ast_debug(3,"\n%s",request);
 
 	/* Send request.  Bypass player->end using temp. */
 	if (!SendRequest(player->fd,request,&temp))
@@ -1465,7 +2095,7 @@ static int SipSpeakerInvite(struct RtspPlayer *player, char *username, int audio
 	player->cseqm[INVITE]++;
 
  
-	ast_debug(1,"<SIP INVITE [%s]\n",username);
+      //ast_debug(1,"<SIP INVITE [%s]\n",username); //changed [v2.0]
 
 	/* ok */
 	return 1;
@@ -1488,7 +2118,7 @@ static int SipSpeakerAck(struct RtspPlayer *player, char *username, int response
 	int temp;
 	char request[1024];
 
-	ast_debug(1,">SIP ACK [%s]\n",username);
+	ast_debug(1,"<SIP ACK [%s]\n",username); //changed [v2.0]
 
 	if(response_type == 2)
 	{
@@ -1500,7 +2130,7 @@ static int SipSpeakerAck(struct RtspPlayer *player, char *username, int response
 		 * Call-ID: Same for all requests in dialog
 		 * Branch: Unique across space and time for 2xx response. (8.1.1.7) Contradicts 17.1.1.3.
  		*/
-		ast_debug(3,"Prepare SIP Ack for response 2xx\n");
+		ast_debug(3,"prepare sip ack for response 2xx\n");
 		generateBranch(player);
 	}
 	else
@@ -1509,7 +2139,7 @@ static int SipSpeakerAck(struct RtspPlayer *player, char *username, int response
 		 * Sec 8.1.1.7
 		 * Branch: ACK for a non-2xx will have the same Branch-ID as the INVITE response being ACK'd
 		 */
-		ast_debug(3,"Prepare SIP Ack for response 3xx to 6xx\n");
+		ast_debug(3,"prepare sip ack for response 3xx to 6xx\n");
 	} 
 	snprintf(request,1024,
 			"ACK sip:%s@%s:%i SIP/2.0\r\n"
@@ -1529,7 +2159,7 @@ static int SipSpeakerAck(struct RtspPlayer *player, char *username, int response
         
 	/* End request */
 	strcat(request,"\r\n");
-	ast_debug(3,"-Sending SIP Ack:\n%s",request);
+	ast_debug(3,"\n%s",request); //changed [v2.0]
 
 	/* Send request.  Bypass player->end using temp. */
 	if (!SendRequest(player->fd,request,&temp))
@@ -1537,7 +2167,7 @@ static int SipSpeakerAck(struct RtspPlayer *player, char *username, int response
 		return 0;
 
 	/* Log */
-	ast_debug(1,"<SIP ACK [%s]\n",username);
+      //ast_debug(1,"<SIP ACK [%s]\n",username); //changed [v2.0]
 
 	return 1;
 }
@@ -1549,10 +2179,11 @@ static int SipSpeakerBye(struct RtspPlayer *player, char *username )
 	char request[1024];
 	int  req_string_len = 0;
 
-	ast_debug(1,">SIP BYE [%s]\n",username);
+	ast_debug(1,"<SIP BYE [%s]\n",username); //changed [v2.0]
 
 	if (!player->in_a_dialog) { /* If not in a dialog, no need to send a BYE */
-		ast_log(LOG_DEBUG,">SIP BYE [%s]\n",username);
+              //ast_log(LOG_DEBUG,">SIP BYE [%s]\n",username); //changed v2.0
+	        ast_debug(3,"not in a dialog\n"); //added [v2.0]
 		return 0;
 	}
 	/* generate a new branch (correlation tag) across space/time for all new requests */
@@ -1580,13 +2211,13 @@ static int SipSpeakerBye(struct RtspPlayer *player, char *username )
 	/* End Message Header */
 	req_string_len += sprintf(request+req_string_len,"\r\n");
 
-	ast_debug(3,"-sending sip bye:\n%s",request);
+	ast_debug(3,"\n%s",request); //added [v2.0]
 
 	/* Send request.  Bypass player->end using temp. */
 	if (!SendRequest(player->fd,request,&temp))
 		return 0;
 
-	ast_debug(1,"<SIP BYE [%s]\n",username);
+      //ast_debug(1,"<SIP BYE [%s]\n",username); //changed [v2.0]
 	return 1;
 }
 
@@ -1597,7 +2228,7 @@ static int RtspPlayerSetupAudio(struct RtspPlayer* player,const char *url)
 
 	/* Log */
      /*	ast_log(LOG_DEBUG,"-SETUP AUDIO [%s]\n",url); OLD */
-	ast_debug(2,"-SETUP AUDIO [%s]\n",url);
+	ast_debug(1,"<RTSP SETUP for audio [%s]\n",url); //added [v2.0]
 
 	/* if it got session */
 	if (player->numSessions)
@@ -1632,6 +2263,7 @@ static int RtspPlayerSetupAudio(struct RtspPlayer* player,const char *url)
 	}
 
 	/* Send request */
+	ast_debug(3,"\n%s\n",request); //Added [v2.0]
 	if (!SendRequest(player->fd,request,&player->end))
 		/* exit */
 		return 0;
@@ -1702,7 +2334,7 @@ static int RtspPlayerPlay(struct RtspPlayer* player)
 
 	/* Log */
      /*	ast_log(LOG_DEBUG,"-PLAY [%s]\n",player->url); OLD */
-	ast_debug(1,"-PLAY [%s]\n",player->url);
+	ast_debug(1,"<RTSP PLAY for audio [%s]\n",player->url); //added [v2.0]
 
 	/* if not session */
 	if (!player->numSessions)
@@ -1722,6 +2354,7 @@ static int RtspPlayerPlay(struct RtspPlayer* player)
 				player->hostport,player->url,player->cseq,player->session[i]);
 
 		/* Send request */
+	        ast_debug(3,"\n%s\n",request); //Added [v2.0]
 		if (!SendRequest(player->fd,request,&player->end))
 			/* exit */
 			return 0;
@@ -1741,7 +2374,7 @@ static int RtspPlayerTeardown(struct RtspPlayer* player)
 
 	/* Log */
      /*	ast_log(LOG_DEBUG,"-TEARDOWN\n"); OLD */
-	ast_debug(1,"-TEARDOWN\n");
+	ast_debug(1,"<RTSP TEARDOWN\n"); //changed [v2.0]
 
 	/* if not session */
 	if (!player->numSessions)
@@ -1760,6 +2393,7 @@ static int RtspPlayerTeardown(struct RtspPlayer* player)
 				"\r\n",
 				player->hostport,player->url,player->cseq,player->session[i]);
 		/* Send request */
+		ast_debug(3, "\n%s\n",request); //Added [v2.0]
 		if (!SendRequest(player->fd,request,&player->end))
 			/* exit */
 			return 0;
@@ -1943,7 +2577,7 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 				if(sdp->audio->peer_media_port == 0)
 					ast_log(LOG_WARNING,"    peer rtp port is not provided\n");
 				else{
-					ast_debug(3,"    peer rtp port: %i\n",sdp->audio->peer_media_port);
+					ast_debug(3,"      peer rtp port: %i\n",sdp->audio->peer_media_port);
 					if (strncmp(k-1,"RTP",3)==0) {
 						ast_log(LOG_ERROR,"Peer RTP transport is not RTP\n");
 						sdp->audio->peer_media_port = 0;
@@ -1988,10 +2622,10 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 
 					media->formats[n]->new_format = ast_format_compatibility_bitfield2format( mimeTypes[f].format);
 					if(media->formats[n]->new_format == NULL) /*ADDED */
-						ast_debug(3,"    added new format to list is NULL\n"); /* ADDED  */
+						ast_debug(3,"      added new format to list is NULL\n"); /* ADDED  */
 					else
-					     /* ast_debug(3,"    added format %llx to list \n",mimeTypes[f].format);  ADDED  */
-						ast_debug(3,"    added format %"PRIx64" to list \n",mimeTypes[f].format); /* PORT17.5 Proper way to print */
+					     /* ast_debug(3,"      added format %llx to list \n",mimeTypes[f].format);  ADDED  */
+						ast_debug(3,"      added format %"PRIx64" to list \n",mimeTypes[f].format); /* PORT17.5 Proper way to print */
 
 					/* Set payload */
 					media->formats[n]->payload = atoi(i+9);
@@ -2167,6 +2801,7 @@ static int CheckHeaderValue(char *buffer,int bufferLen,char *header,char*value)
 	return (strncasecmp(buffer+i,value,strlen(value))==0);
 }
 
+#ifdef OLD_AUTH_SCHEME
 /* [17.x NEW] for Digest Authentication */
 static int GetAuthHeaderData(struct RtspPlayer *player, char *buffer,int bufferLen ,struct DigestAuthData *digest_data)
 {
@@ -2195,7 +2830,7 @@ static int GetAuthHeaderData(struct RtspPlayer *player, char *buffer,int bufferL
 				digest_data->rx_realm[j-i] = *j; 
 				j++;
 			}
-                        /* [2025.5] Asteriisk compiler complains when -1 is rightmost in an array */
+                        /* [v1.1] Asterisk compiler complains when -1 is rightmost in an array */
                         //digest_data->rx_realm[j-i-1]='\0'; /* rewind 1; change last '"' to a termination */      
                         digest_data->rx_realm[j-1-i]='\0'; /* rewind 1; change last '"' to a termination */
 
@@ -2223,6 +2858,7 @@ static int GetAuthHeaderData(struct RtspPlayer *player, char *buffer,int bufferL
 
 	return 1;
 }
+#endif
 
 /* [17.x NEW] For SIP */ 
 static int SipSetPeerTag(struct RtspPlayer *player, char *buffer,int bufferLen)
@@ -2383,7 +3019,7 @@ static int SipSpeakerReply(struct RtspPlayer *player, char *buffer, int bufferLe
 	else {
 		ast_debug(3,"-sip reply nothing to send\n");
 	} 
-	ast_debug(1,"<SIP Reply [%s]\n",username);
+	ast_debug(1,"<sip reply [%s]\n",username);
 	return 1;
 }
 
@@ -2778,31 +3414,58 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 				case RTSP_DESCRIBE:
 					/* log */
 				     /*	ast_log(LOG_DEBUG,"-Receiving describe\n"); OLD */
-					ast_debug(2,"-receiving describe\n");
+					ast_debug(2,"-rx describe response\n");
 					/* Read into buffer */
 					if (!RecvResponse(player->fd,buffer,&bufferLen,bufferSize,&player->end))
 						break;
-					ast_debug(5,"bufferLen: %i\n%s",bufferLen,buffer);
+			              //ast_debug(5,"bufferLen: %i\n%s",bufferLen,buffer);
+					ast_debug(3, "\n%s\n",buffer); 
 
 					/* Check for response code */
 					responseCode = GetResponseCode(buffer,bufferLen,0);
 
 				     /*	ast_log(LOG_DEBUG,"-Describe response code [%d]\n",responseCode); OLD */
-					ast_debug(3,"-Describe response code [%d]\n",responseCode);
+					ast_debug(3,"-describe response code [%d]\n",responseCode);
 
 					/* Check unathorized */
 					if (responseCode==401)
 					{
 						/* Check athentication method */
 
+                                                /* [v2.0]  Adding new way of detecting authentication method */
+					        ast_debug(3,"  describe 401 Processing\n");
+					        ast_debug(3,"    - Checking for Auth Method of Basic\n");
+                                                struct BasicAuthData basic_data;
+                                                if (GetAuthSchemeBasic(buffer,bufferLen,&basic_data) == 0 )
+                                                {
+					            ast_debug(3,"    - Found Auth Method of Basic\n");
+
+						    /* Create Basic authentication header */
+						    RtspPlayerBasicAuthorization(player,username,password);
+						    /* Send again the describe */
+						    RtspPlayerDescribe(player,url);
+						    /* Enter loop again */
+						    break;
+                                                }
+                                                else
+                                                {
+					            ast_debug(3,"    - No Auth Method of Basic\n");
+						    /* Error */
+						    ast_log(LOG_ERROR,"-No Basic Authentication found for RTSP (Digest Auth not yet supported).\n");	
+						    /* End */
+						    player->end = 1;
+						    /* Exit */
+						    break;
+                                                }
+#ifdef OLD_AUTH_SCHEME
 						/* 
 						 * PORT 17.3.  The Basic Realm header format may be device dependent.
 						 * Original code did not work for my cameras.
 						 */
-					     /*	if (CheckHeaderValue(buffer,bufferLen,"WWW-Authenticate","Basic realm=\"/\"")) */
-						if (CheckHeaderValue(buffer,bufferLen,"WWW-Authenticate","Basic realm="))
+					      //if (CheckHeaderValue(buffer,bufferLen,"WWW-Authenticate","Basic realm=\"/\"")) */
+				                if (CheckHeaderValue(buffer,bufferLen,"WWW-Authenticate","Basic realm="))
 						{
-							/* Create authentication header */
+							/* Create Basic authentication header */
 							RtspPlayerBasicAuthorization(player,username,password);
 							/* Send again the describe */
 							RtspPlayerDescribe(player,url);
@@ -2810,24 +3473,14 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 							break;
 						} else {
 							/* Error */
-							ast_log(LOG_ERROR,"-No Authenticate header found\n");	
-#ifdef FORCEBASIC_AUTH_RTSP
-/* 
- * 2025.5 temp workaround. 
- * There is a bug where some cameras send Basic auth in a second Auth header
- * which isn't supported causing this error, so force Basic Auth anyway.
- */
-							ast_log(LOG_WARNING,"Forcing Basic Auth anyway\n");	
-							RtspPlayerBasicAuthorization(player,username,password);
-							RtspPlayerDescribe(player,url);
-							break;
-#else
+					              //ast_log(LOG_ERROR,"-No Authenticate header found\n");	
+							ast_log(LOG_ERROR,"-No Basic Authentication found for RTSP (Digest Auth not yet supported).\n");	
 							/* End */
 							player->end = 1;
 							/* Exit */
 							break;
-#endif
 						}
+#endif
 					}
 
 					/* On any other erro code */
@@ -3145,10 +3798,11 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 				case RTSP_SETUP_AUDIO:
 					/* log */
 				     /*	ast_log(LOG_DEBUG,"-Recv audio response\n"); OLD */
-					ast_debug(2,"-Recv audio response\n");
+					ast_debug(2,"-rx rtsp setup for audio response\n");
 					/* Read into buffer */
 					if (!RecvResponse(player->fd,buffer,&bufferLen,bufferSize,&player->end))
 						break;
+					ast_debug(3, "\n%s\n",buffer); //Added [v2.0]
 					/* Search end of response */
 					if ( (responseLen=GetResponseLen(buffer)) == 0 )
 						/*Exit*/
@@ -3285,8 +3939,10 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 					break;
 				case RTSP_PLAY:
 					/* Read into buffer */
+					ast_debug(2,"-rx rtsp play response\n");
 					if (!RecvResponse(player->fd,buffer,&bufferLen,bufferSize,&player->end))
 						break;
+					ast_debug(3, "\n%s\n",buffer); //Added [v2.0]
 					/* Search end of response */
 					if ( (responseLen=GetResponseLen(buffer)) == 0 )
 						/*Exit*/
@@ -3501,7 +4157,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
      				send(player->audioRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
 				/* log */
 			    /*	ast_log(LOG_DEBUG,"-Sent rtcp audio report [%d]\n",errno); OLD */
-				ast_debug(2,"-Sent rtcp audio report [%d]\n",errno); 
+				ast_debug(2,"-sent rtcp audio report [%d]\n",errno); 
 			} else {
 				/* Create rtcp packet */
 				MediaStatsRR(&player->videoStats,&rtcp);
@@ -3511,7 +4167,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
      				send(player->videoRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
 				/* log */
 			     /*	ast_log(LOG_DEBUG,"-Sent rtcp video report [%d]\n",errno); OLD */
-				ast_debug(2,"-Sent rtcp video report [%d]\n",errno); 
+				ast_debug(2,"-sent rtcp video report [%d]\n",errno); 
 			}
 		/* ADDED. SIP States */
 		} else if (outfd==sip_speaker->fd) { /* outfd >0 */
@@ -3519,22 +4175,22 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 			switch (sip_speaker->state)
 			{
 			    	case SIP_STATE_OPTIONS:
-			        	ast_debug(5,"-Receiving sip options\n");
+			               //ast_debug(5,"-Receiving sip options\n");
 					/* Read into buffer. ignore player->end by using temp*/
 					if (!(recvLen=RecvResponse(sip_speaker->fd,buffer,&bufferLen,bufferSize,&temp)))
 					{
 						break; /* switch-case */
 					}
-					ast_debug(3, "-sip options response \n%s\n",buffer); 
+					ast_debug(3, "-rx sip options response \n%s\n",buffer); 
 					/* Check for response code */
 					responseCode = GetResponseCode(buffer,bufferLen,1);
 
-					ast_debug(3,"-SIP Options response code [%d]\n",responseCode);
+					ast_debug(3,"-sip options response code [%d]\n",responseCode);
 					/* done with SIP message */
 					bufferLen =0;
 					break;
 			    	case SIP_STATE_INVITE:
-			        	ast_debug(3,"-sip invite response\n");
+			        	ast_debug(3,"-rx sip invite response\n");
 
 					/* Read into buffer. ignore player->end by using temp*/
 					bufferLen =0; /* TEMP */
@@ -3544,19 +4200,19 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 
 					/* Check for response code */
 					responseCode = GetResponseCode(buffer,bufferLen,1);
-					ast_debug(3,"-SIP Invite response code [%d]\n",responseCode);
+					ast_debug(3,"-sip invite response code [%d]\n",responseCode);
 
 					if (responseCode>=100 && responseCode<=199)
 					{   /* Provisional Response codes */
 						switch(responseCode){
 							case 100:
-								ast_debug(3,"-rx sip invite response: 100 Trying\n");
+								ast_debug(3,"-sip invite response: 100 Trying\n");
 								break;
 							case 180:
-								ast_debug(3,"-rx sip invite response: 180 Ringing\n");
+								ast_debug(3,"-sip invite response: 180 Ringing\n");
 								break;
 							default:
-								ast_debug(3,"-rx sip invite response: Unsupported 1xx Provisional response code\n");
+								ast_debug(3,"-sip invite response: Unsupported 1xx Provisional response code\n");
 						}
 					}
 					else if (responseCode>=200 && responseCode<=299)
@@ -3583,7 +4239,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 								if ( (responseLen=GetResponseLen(buffer)) == 0 )
 									break; /* switch-case */
 
-								ast_debug(1, "ResponseLen: %i\n",responseLen); /*tjl*/
+								ast_debug(5, "ResponseLen: %i\n",responseLen); /*tjl*/
 								contentLength = GetHeaderValueInt(buffer,responseLen,"Content-Length");	
 								if (!CheckHeaderValue(buffer,responseLen,"Content-Type","application/sdp"))
 								{
@@ -3652,7 +4308,63 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 								ast_log(LOG_ERROR,"SIP: 400 Bad Request. Not Processing.\n");
 								break;
 							case 401:
-								ast_debug(3,"-Processing SIP 401 Unauthorized\n");
+					                       ast_debug(3,"  sip invite 401 processing\n");
+
+                                                                /* [v2.0]  Adding new way of detecting authentication method */
+					                        ast_debug(3,"    - Checking for Auth Method of Basic\n");
+
+                                                                struct BasicAuthData basic_data;
+
+                                                                if (GetAuthSchemeBasic(buffer,bufferLen,&basic_data) == 0 )
+                                                                {
+					                            ast_debug(3,"    - Found Auth Method of Basic\n");
+						                    ast_log(LOG_WARNING,"SIP Code does not yet support Basic Auth\n");
+                                                                }
+                                                                else
+                                                                {
+					                            ast_debug(3,"    - No Auth Method of Basic\n");
+					                            ast_debug(3,"    - Checking for Auth Method of Digest\n");
+
+                                                                    struct DigestAuthData digest_data;
+
+                                                                    if (GetAuthSchemeDigest(buffer,bufferLen,&digest_data) == 0 )
+                                                                    {
+					                                ast_debug(3,"    - Found Auth Method of Digest\n");
+									char *nc = NULL;
+									char *cnonce = NULL;
+									char *qop = NULL;
+									char uri[64];
+									sprintf(uri,"sip:%s@%s:%i", username,sip_speaker->ip,sip_port);
+									char *method = "INVITE";
+ 
+									ast_debug(5,"  Challenge Response Data- rx_realm: %s nonce: %s uri %s",\
+										digest_data.rx_realm, digest_data.nonce,uri); 
+                                              
+									RtspPlayerDigestAuthorization(sip_speaker,username,\
+											password, sip_realm,\
+											digest_data.nonce, nc, cnonce, qop, uri, \
+											digest_data.rx_realm, method, 1);
+
+									/* Try Invite again w. Auth */
+									if(sip_speaker->cseqm[INVITE] == 3)   
+										ast_debug(3,"  Too many INVITEs \n");
+									else
+									{
+										if (!SipSpeakerInvite(sip_speaker,username,audioFormat,1))
+										{
+											ast_log(LOG_ERROR,"SIP: Couldn't formulate/send INVITE\n");
+											/* Nothing else to do, simply don't do any more SIP stuff */
+										}
+									}
+                                                                    }
+                                                                    else
+                                                                    {
+					                                ast_debug(3,"    - No Auth Method of Digest\n");
+							                ast_log(LOG_ERROR,"No Basic/Digest Authentication header/data present\n");
+                                                                    }
+                                                                }
+
+#ifdef OLD_AUTH_SCHEME
 								if (CheckHeaderValue(buffer,bufferLen,"WWW-Authenticate","Basic realm="))
 								{
 									ast_log(LOG_WARNING,"SIP Code does not yet support Basic Auth\n");
@@ -3663,7 +4375,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 
 									if(GetAuthHeaderData(sip_speaker,buffer,bufferLen,&digest_data) == -1)
 									{
-									ast_log(LOG_ERROR,"SIP: WWW-Authenticate header missing\n");
+									    ast_log(LOG_ERROR,"SIP: WWW-Authenticate header missing\n");
 									}
 									char *nc = NULL;
 									char *cnonce = NULL;
@@ -3672,7 +4384,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 									sprintf(uri,"sip:%s@%s:%i", username,sip_speaker->ip,sip_port);
 									char *method = "INVITE";
  
-									ast_debug(5,"GetChallenge Response- rx_realm: %s nonce: %s uri %s",\
+									ast_debug(5,"  GetChallenge Response- rx_realm: %s nonce: %s uri %s",\
 										digest_data.rx_realm, digest_data.nonce,uri); 
                                               
 									RtspPlayerDigestAuthorization(sip_speaker,username,\
@@ -3692,6 +4404,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 										}
 									}
 								}
+#endif
 								break;
 							case 420:
 								sip_speaker->state = SIP_STATE_NONE;
@@ -3725,18 +4438,18 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 						/* Send OK back to peer */
 						if( SipSpeakerReply(sip_speaker,buffer,bufferLen,username,ip,sip_port,"BYE")==1)
 							enable_sip_tx=0;
-						ast_debug(1,"<BYE\n"); 
+					      //ast_debug(1,"<BYE\n"); //changed [v2.0]
 						}
 					else if (strncmp(buffer,"INFO",4)==0) {
 						ast_debug(1,">INFO\n"); 
 						/* Send OK back to peer */
 						if( SipSpeakerReply(sip_speaker,buffer,bufferLen,username,ip,sip_port,"BYE")==1)
 							ast_debug(3,"send OK\n");
-						ast_debug(1,"<INFO\n"); 
+			                	//ast_debug(1,"<INFO\n"); //change [v2.0]
 					}
 					else if (strncmp(buffer,"CANCEL",5)==0) {
 						ast_debug(1,">CANCEL\n"); 
-						ast_debug(1,"<CANCEL\n"); 
+				              //ast_debug(1,"<CANCEL\n"); //change [v2.0]
 					}
 					else {
 						ast_log(LOG_ERROR,"Unsupported SIP Request receive");
@@ -3773,7 +4486,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 						send(player->audioRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
 						/* log */
 					     /*	ast_log(LOG_DEBUG,"-Sent rtcp audio report [%d]\n",errno); OLD */
-						ast_debug(2,"-Sent rtcp audio report [%d]\n",errno); 
+						ast_debug(2,"-sent rtcp audio report [%d]\n",errno); 
 					}
 					/* If got audio */
 					if (player->videoRtcp>0)
@@ -3786,20 +4499,20 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 						send(player->videoRtcp, &rtcp, (rtcp.common.length+1)*4, 0);
 						/* log */
 					     /*	ast_log(LOG_DEBUG,"-Sent rtcp video report [%d]\n",errno); OLD */
-						ast_debug(2,"-Sent rtcp video report [%d]\n",errno); 
+						ast_debug(2,"-sent rtcp video report [%d]\n",errno); 
 					}
 					/* Send OPTIONS */
                                         RtspPlayerOptions(player,url);
 					/* log */
 				     /*	ast_log(LOG_DEBUG,"-Sending OPTIONS and reseting RTCP timer\n"); OLD */
-					ast_debug(2,"-Sending OPTIONS and reseting RTCP timer\n");
+					ast_debug(2,"-sending options and resetting RTCP timer\n");
 					/* Reset timeout value */
 					rtcptv = ast_tvnow();
 				}
 			} else {
 				/* log */
 			     /*	ast_log(LOG_DEBUG,"-Init RTCP timer\n"); */
-				ast_debug(2,"-Init RTCP timer\n");
+				ast_debug(2,"-init RTCP timer\n");
 				/* Init timeout value */
 				rtcptv = ast_tvnow();
 			}
@@ -3839,7 +4552,51 @@ rstp_play_stop:
 						SipSetPeerTag(sip_speaker,buffer,bufferLen);
 						sip_speaker->cseqm[ACK] = sip_speaker->cseqm[BYE] - 1;
 						SipSpeakerAck(sip_speaker,username,4);
-						if (CheckHeaderValue(buffer,bufferLen,"WWW-Authenticate","Basic realm="))
+
+                                                /* [v2.0]  Adding new way of detecting authentication method */
+					        ast_debug(3,"  sip bye 401 Processing\n");
+					        ast_debug(3,"    - Checking for Auth Method of Basic\n");
+                                                struct BasicAuthData basic_data;
+                                                if (GetAuthSchemeBasic(buffer,bufferLen,&basic_data) == 0 )
+                                                {
+					            ast_debug(3,"    - Found Auth Method of Basic\n");
+						    ast_log(LOG_WARNING,"SIP Code does not yet support Basic Auth\n");
+                                                }
+                                                else
+                                                {
+					            ast_debug(5,"    - No Auth Method of Basic\n");
+					            ast_debug(5,"    - Checking for Auth Method of Digest\n");
+
+                                                    struct DigestAuthData digest_data;
+                                                    if (GetAuthSchemeDigest(buffer,bufferLen,&digest_data) == 0 )
+                                                    {
+					                ast_debug(3,"    - Found Auth Method of Digest\n");
+							char *nc = NULL;
+							char *cnonce = NULL;
+							char *qop = NULL;
+							char uri[64];
+							sprintf(uri,"sip:%s@%s:%i", username,sip_speaker->ip,sip_port);
+							char *method = "BYE";
+
+							ast_debug(5,"  input data for challenge response- rx_realm: %s nonce: %s uri %s",\
+								digest_data.rx_realm, digest_data.nonce,uri);
+
+							RtspPlayerDigestAuthorization(sip_speaker,username,password, sip_realm,\
+									digest_data.nonce, nc, cnonce, qop, uri, \
+									digest_data.rx_realm, method, 1);
+
+							/* Try Bye again w. Auth */
+							SipSpeakerBye(sip_speaker,username);
+                                                    }
+                                                    else
+                                                    {
+					                ast_debug(3,"    - No Auth Method of Digest\n");
+							ast_log(LOG_ERROR,"No Basic/Digest Authentication header/data present\n");
+                                                    }
+                                                }
+
+#ifdef OLD_AUTH_SCHEME
+				                if (CheckHeaderValue(buffer,bufferLen,"WWW-Authenticate","Basic realm="))
 						{
 							ast_log(LOG_WARNING,"SIP Code does not yet support Basic Auth\n");
 						}
@@ -3857,7 +4614,7 @@ rstp_play_stop:
 							sprintf(uri,"sip:%s@%s:%i", username,sip_speaker->ip,sip_port);
 							char *method = "BYE";
 
-							ast_debug(5,"GetChallenge Response- rx_realm: %s nonce: %s uri %s",\
+							ast_debug(5,"  GetChallenge Response- rx_realm: %s nonce: %s uri %s",\
 								digest_data.rx_realm, digest_data.nonce,uri);
 
 							RtspPlayerDigestAuthorization(sip_speaker,username,password, sip_realm,\
@@ -3867,6 +4624,7 @@ rstp_play_stop:
 							/* Try Bye again w. Auth */
 							SipSpeakerBye(sip_speaker,username);
 						}
+#endif
 					}
 				}
 			}
