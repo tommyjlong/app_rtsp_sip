@@ -89,7 +89,12 @@
  * Makes "Realm" an optional parameter when making an Asterisk call to this app.
  *   Just pass in ",," instead of ",NAME_OF_REALM,"
  *
+ * [v3.1] 
+ * Bug fix.  There were times when camera would send the audio stream on the SIP
+ * audio socket instead of the RTSP audio socket.  The fix delays SIP until RTSP playing
+ * of the audio stream has been acknowledged.
  */
+#define VERSION "3.1"
 
 /* Use the following to test for Buffer length issues */
 /* #define TEST_BUFFER */
@@ -3566,6 +3571,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 	struct RtspPlayer *sip_speaker = NULL;/* sip will make use of RTSP data structures */
 
 	/* log */
+	ast_log(LOG_NOTICE,"app_rtsp_sip version = %s\n", VERSION); /* added [3.1] */
      /*	ast_log(LOG_WARNING,">rtsp_sip main loop\n");    was "rtsp play" */
 	ast_log(LOG_NOTICE,">rtsp-sip main loop\n");
 
@@ -4354,7 +4360,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                 }
 						/* play */
 						RtspPlayerPlay(player);
-
+#ifdef OLD_SIP_START
 						/* 
 						 * ADDed. 
 						 * RTSP is now playing so get SIP going.
@@ -4369,6 +4375,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 		                                        	/* Nothing else to do, simply don't do any more SIP stuff */
 							}
 						}
+#endif
 					}
 					break;
 				case RTSP_SETUP_VIDEO:
@@ -4492,6 +4499,21 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 					MediaStatsReset(&player->videoStats);
 					/* Set playing state */
 					player->state = RTSP_PLAYING;
+
+					/* 
+					 * ADDed. [v3.1] Changed to start SIP after RTSP Play actually gets started.
+					 * RTSP is now playing so get SIP going.
+					 * We also know which audio codec to use (see audioFormat). 
+					 */
+
+					/* Send SIP unauthorized INVITE */
+					if(sip_enable){
+						if (!SipSpeakerInvite(sip_speaker,username,audioFormat,0))
+						{
+							ast_log(LOG_ERROR,"Couldn't formulate/send INVITE\n");
+	                                        	/* Nothing else to do, simply don't do any more SIP stuff */
+						}
+					}
 					break;
 				case RTSP_PLAYING:
 					/* Read into buffer */

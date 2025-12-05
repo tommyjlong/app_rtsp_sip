@@ -10,7 +10,6 @@ In-line documentation was added to app_rtsp_sip.c so that one can view its docum
 ## Restrictions/Limits/Quirks
 - `app_rtsp_sip` has been developed and tested on a couple of Vivotek Cameras, as well as a Vivint Video Doorbell running Vivotek software that was configured for local use with Home Assistant.  It is possible that `app_rtsp_sip` may work with other cameras/devices but it is left up to the user of this software to determine how best to work with this code for such devices.
 - Digest authentication uses hashing code that may not work on certain cpu architectures possibly those running Big Endian (but not tested).
-- Some Vivotek Cameras will sometimes send audio over the SIP established socket instead of the RTSP socket.  This app will detect this and gracefully close the connection.
 
 The RTSP portion of the code originially developed by Sergio Garcia Murillo and that has been ported to more modern versions of Asterisk has not been tested for the following:
 - RTSP Video
@@ -267,6 +266,8 @@ description: "Setup the debug logging levels for app_rtsp_sip"
 ```
 Then place a call to the device using app_rtsp_sip.  The file `full.txt` should contain several DEBUG lines for app_rtsp_sip.
 # History
+- version 3.1
+  - Delays the start of SIP until after the camera has OK'd the PLAYing of video/audio.  This seems to fix the problem where some cameras would send audio over the SIP established audio socket instead of the audio socket setup by RTSP.
 - version 3.0
   - Adds support for the more modern RFC2617 style Digest Authentication.
   - Adds Digest Authentication for RTSP.
@@ -279,4 +280,5 @@ Then place a call to the device using app_rtsp_sip.  The file `full.txt` should 
 - version 1.0 Ported the original app_rtsp.c code to Asterisk version 17.x and add a SIP client to call the camera for setting up a audio channel to the camera.
 # Credits
 - Sergio Garcia Murillo, the author of the original app_rtsp.c code.
+
 
