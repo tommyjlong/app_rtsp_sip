@@ -93,8 +93,9 @@
  * Bug fix.  There were times when camera would send the audio stream on the SIP
  * audio socket instead of the RTSP audio socket.  The fix delays SIP until RTSP playing
  * of the audio stream has been acknowledged.
+ * [v3.2] Bug fix. Too many crlfs in rtsp setup.
  */
-#define VERSION "3.1"
+#define VERSION "3.2"
 
 /* Use the following to test for Buffer length issues */
 /* #define TEST_BUFFER */
@@ -2618,8 +2619,7 @@ static int RtspPlayerSetupAudio(struct RtspPlayer* player,const char *url)
 				"CSeq: %d\r\n"
 				"%s"
 				"Transport: RTP/AVP;unicast;client_port=%d-%d\r\n"
-				"User-Agent: app_rtsp\r\n"
-				"\r\n",
+				"User-Agent: app_rtsp\r\n",
 				url,player->cseq,sessionheader,player->audioRtpPort,player->audioRtcpPort);
 	} else {
 		/* Prepare request */
@@ -2686,8 +2686,7 @@ static int RtspPlayerSetupVideo(struct RtspPlayer* player,const char *url)
 				"CSeq: %d\r\n"
 				"%s"
 				"Transport: RTP/AVP;unicast;client_port=%d-%d\r\n"
-				"User-Agent: app_rtsp\r\n"
-				"\r\n",
+				"User-Agent: app_rtsp\r\n",
 				url,player->cseq,sessionheader,player->videoRtpPort,player->videoRtcpPort);
 	} else {
 		/* Prepare request */
