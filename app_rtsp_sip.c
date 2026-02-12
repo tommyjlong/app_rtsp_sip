@@ -93,12 +93,22 @@
  * Bug fix.  There were times when camera would send the audio stream on the SIP
  * audio socket instead of the RTSP audio socket.  The fix delays SIP until RTSP playing
  * of the audio stream has been acknowledged.
- * [v3.2] Bug fix. Too many crlfs in rtsp setup.
+ * [v3.2] 
+ *  - Bug Fix - Too many crlfs in rtsp setup in one of the code paths.
+ *  - Bug Fix - Auth Header parser was overwriting correct auth params
+ *  - Change - Don't continuously retry RTSP DESCRIBE or SIP INVITE failed auths. 
+ *             After a couple of failures, end the call.
+ *  - Feature Add - Added way for user to request to skip Basic Auth using configured realm string.
+ *      Hikvision 6114 camera advertises for an RSTP Descibe that is supports Basic Auth
+ *      when it actually doesn't.  When the user call passes in the configured realm,
+ *      if it starts with a string "digest_only:"  then Basc Auth will be skipped.
+ *  - Adder - Add more packet counters and channel write fail counters.
+ *  - Adder - Debug to indicate which tcp/udp ports are being used.
  */
 #define VERSION "3.2"
 
-/* Use the following to test for Buffer length issues */
-/* #define TEST_BUFFER */
+/* Use the following to fake out a message received from the remote endpoint */
+//#define TEST_DESCR_AUTH_BUFF 
 
 #include <asterisk.h>
 #include "asterisk/app.h" /* PORT 17.3 ADDed for parsing args */
@@ -175,7 +185,7 @@
 			<parameter name="RTSP-URL" required="true">
 				<para>RTSP url of the target device to be played. 
 				Format: rtsp://username:password@address/stream-id.
-				'username' and 'password' are optional for login to the device using Basic Authentication. 
+				'username' and 'password' are needed for login to the device using Authentication. 
 				'address' is domain name or ip address of target device. 
 				'stream-id' optionally identifies the stream to be played.</para>
 			</parameter>
@@ -209,6 +219,7 @@
 
 #define MAX_TOKEN 512        //number of chars say in a name, a key, a value
 #define MAX_AUTH_KEY_VAL 20  //max num of an auth scheme's parameters as key/value pairs
+
 
 typedef struct {
     char field_name[MAX_FIELD_NAME];
@@ -955,8 +966,9 @@ static int CheckAuthScheme(char *buffer,int bufferLen, char *scheme_to_match, ch
     char *paramval[MAX_AUTH_KEY_VAL];
     int  param_count;
     int  i,j;
-    int return_code=-10;
+    int  return_code=-10;
     char *auth_start;
+    int  found_auth_scheme = 0; /* v3.2 fix */
 
     char *rest;       /* rest of the string after Auth Scheme (which are the params) */
     char *more_auths; /* Another Auth Scheme (and its params) found afterwards */
@@ -991,7 +1003,10 @@ static int CheckAuthScheme(char *buffer,int bufferLen, char *scheme_to_match, ch
                         {
                             ast_debug(5,"    Found matching Auth-Scheme: %s\n", scheme_to_match);
                             return_code= 0;
-                        }         
+			    found_auth_scheme = 1; /* v3.2 fix */
+                        } 
+			else
+			    found_auth_scheme = 0; /* v3.2 fix */
 
                         if (*rest == '\0') {
                             ast_debug(5,"    No parameters or token68 found.\n");
@@ -1011,7 +1026,7 @@ static int CheckAuthScheme(char *buffer,int bufferLen, char *scheme_to_match, ch
                               //printf("Param Count: %d\n", param_count);
                                 for ( j = 0; j < param_count; j++) {
                                     ast_debug(5,"  Paramkey[%d]: %s    Paramval[%d]: %s\n", j,paramkey[j], j, paramval[j]);
-                                    if( return_code == 0)
+                                    if( found_auth_scheme == 1) /* v3.2 fix to not override existing auth params*/
                                     {
                                         auth_paramkey[j] = ast_strdup(paramkey[j]); //does a malloc
                                         auth_paramval[j] = ast_strdup(paramval[j]); //does a malloc
@@ -1025,7 +1040,7 @@ static int CheckAuthScheme(char *buffer,int bufferLen, char *scheme_to_match, ch
                         }
                         if (more_auths != NULL)
                         {
-                            ast_debug(6,"  more auths after comma-sep list: %s\n",more_auths);
+                            ast_debug(5,"  more auths after comma-sep list: %s\n",more_auths);
                             auth_start = more_auths;
                         }
 
@@ -1750,7 +1765,7 @@ static int RtspPlayerDigestAuthorization(struct RtspPlayer *player,char *cfg_use
 	else{  /* Left over in the case some day in the future that RTSP Digest auth differs from SIP */
 	     //	sprintf(player->authorization, "Authorization: Digest %s",digest_result);
              // ast_log(LOG_WARNING,"RTSP not tested for Digest Authentication.\n");
-                ast_debug(7,"FUTURE: RTSP using different Digest Authentication that SIP.\n");
+                ast_debug(7,"FUTURE: RTSP using different Digest Authentication than SIP.\n");
 	}
 	ast_debug(3,"      Player Auth String: \n%s\n",player->authorization);
 	return 1;
@@ -1818,7 +1833,7 @@ static void GetUdpPorts(int *a,int *b,int *p,int *q,int isIPv6)
 	*q = ntohs(*port);
 
      /*	ast_log(LOG_DEBUG,"-GetUdpPorts [%d,%d]\n",*p,*q); OLD */
-	ast_debug(4,"-GetUdpPorts initial [%d,%d]\n",*p,*q); 
+	ast_debug(6,"-GetUdpPorts initial [%d,%d]\n",*p,*q); 
 
 	/* Create audio sockets */
 	while ( *p%2 || *p+1!=*q )
@@ -1842,10 +1857,10 @@ static void GetUdpPorts(int *a,int *b,int *p,int *q,int isIPv6)
 		*q = ntohs(*port);
 
 	     /*	ast_log(LOG_DEBUG,"-GetUdpPorts [%d,%d]\n",*p,*q); OLD */
-	        ast_debug(4,"-GetUdpPorts loop [%d,%d]\n",*p,*q); 
+	        ast_debug(6,"-GetUdpPorts loop [%d,%d]\n",*p,*q); 
 	}
 
-	ast_debug(3,"-GetUdpPorts final [%d,%d]\n",*p,*q); /* ADDED */
+	ast_debug(6,"-GetUdpPorts final [%d,%d]\n",*p,*q); /* ADDED */
 
 	/* Free Address*/
      /*	free(sendAddr); OLD */
@@ -1934,9 +1949,11 @@ static int RtspPlayerConnect(struct RtspPlayer *player, const char *ip, int port
 
 	/* Create/Open audio datagram sockets and ports for RTP and RTCP*/
 	GetUdpPorts(&player->audioRtp,&player->audioRtcp,&player->audioRtpPort,&player->audioRtcpPort,isIPv6);
+	ast_debug(3,"  - rx audioRtpPort/RtcpPort to be used: %i/%i\n",player->audioRtpPort,player->audioRtcpPort); /* v3.2 add */
 
 	/* Create/Open video datagram sockets and ports for RTP and RTCP*/
 	GetUdpPorts(&player->videoRtp,&player->videoRtcp,&player->videoRtpPort,&player->videoRtcpPort,isIPv6);
+	ast_debug(3,"  - rx videoRtpPort/RtcpPort to be used: %i/%i\n",player->videoRtpPort,player->videoRtcpPort); /* v3.2 add */
 
 	/* Set non blocking */
 	SetNonBlocking(player->fd);
@@ -1966,7 +1983,7 @@ static int RtspPlayerConnect(struct RtspPlayer *player, const char *ip, int port
 	local_port = ntohs(name.sin_port);
 	player->local_ctrl_ip = ast_strdup(local_ip);
 	player->local_ctrl_port = local_port;
-	ast_debug(3,"Local Ctrl IP: %s, Port: %i\n",player->local_ctrl_ip,player->local_ctrl_port);
+	ast_debug(3,"  - Local Ctrl IP: %s, Port: %i\n",player->local_ctrl_ip,player->local_ctrl_port);
 
 	/* Set ip v6 */
 	player->isIPv6 = isIPv6;
@@ -2959,7 +2976,7 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 	int n = 0;
 	int f = 0;
 
-	ast_debug(4,"SDPContent bufferLen %i buffer:\n%s",bufferLen, buffer); /* ADDED */
+      //ast_debug(4,"SDPContent bufferLen %i buffer:\n%s",bufferLen, buffer); /* v3.2 Don't use this. '\0' beyond bufferLen */
 
 	/* Malloc */
      /*	sdp = (struct SDPContent*) malloc(sizeof(struct SDPContent)); OLD */
@@ -2970,8 +2987,8 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 	sdp->video = NULL;
 
 	/* Read each line */
-     /*	while ( (j=strstr(i,"\n")) != NULL && (j<buffer+bufferLen))  PORT 17.3. Picked up from port to 11.x.x */
-	while ( (j=strstr(i,"\n")) != NULL) 
+      //while ( (j=strstr(i,"\n")) != NULL) 
+       	while ( (j=strstr(i,"\n")) != NULL && (j<buffer+bufferLen))  /* PORT 17.3. picked up from port to 11.x.x */
 	{
 		/* if it's not enougth data */
 		if (j-i<=1)
@@ -3006,7 +3023,7 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 				 */
 				sdp->audio->peer_media_port = (uint16_t) strtol(i+8, &k, 10);
 				if(sdp->audio->peer_media_port == 0)
-					ast_log(LOG_WARNING,"    peer rtp port is not provided\n");
+					ast_debug(5,"    peer rtp port is not provided\n"); /* v3.2 change to debug */
 				else{
 					ast_debug(3,"      peer rtp port: %i\n",sdp->audio->peer_media_port);
 					if (strncmp(k-1,"RTP",3)==0) {
@@ -3047,7 +3064,7 @@ static struct SDPContent* CreateSDP(char *buffer,int bufferLen)
 					/* Set type */
 					media->formats[n]->format = mimeTypes[f].format;
 					/* PORT 17.3 add new Asterisk format.
-					 * bifield2format() takes arg something like AST_FORMAT_ULAW
+					 * bitfield2format() takes arg something like AST_FORMAT_ULAW
 					 * and returns ast_format *ast_format_ulaw 
 					 */
 
@@ -3502,10 +3519,58 @@ static int GetResponseLen(char *buffer)
 	/* Get msg leng */
 	return i-buffer+4;
 }
-
-
-static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url,char *username,char *password,int isIPv6,int sip_enable, char *cfg_realm, int sip_port)
+/*
+ * [v3.2] added to support scheme for user to request Digest Only authentication.
+ * Looks for "digest_only:" (case insensitive) string at the beginning
+ * of the cfg_realm_arg (passed into the user call), and
+ * if it does, then sets the skip_basic parameter to true, and
+ * copies the remaining string into the cfg_realm with the latter
+ * continuing to be used as normal in the rest of the code.
+ * Note: configured realm passed in by user can be an empty string.
+ */
+static int parse_cfg_realm_arg(char *cfg_realm_arg, char *cfg_realm, int* skip_basic)
 {
+    char *result;
+    *skip_basic=0;
+    cfg_realm[0] = '\0';
+
+    if(cfg_realm_arg[0]=='\0')
+    {
+        ast_debug(6,"cfg_realm_arg is empty\n");
+        return 0; /* return early */
+    }
+
+    if( strncasecmp(cfg_realm_arg,  "digest_only:",11 ) == 0 )
+    {
+        ast_debug(6,"match digest_only: hidden string\n");
+	ast_debug(5,"cfg_realm_arg=%s\n",cfg_realm_arg);
+        *skip_basic = 1;
+        // Find the first occurrence of sub_string in main_string
+        result = strstr(cfg_realm_arg, ":");
+
+        // Check if the substring was found
+        if (result != NULL) {
+            ast_debug(6,"cfg_realm_arg substring found at position: %ld\n", result - cfg_realm_arg);
+            ast_debug(6,"Remaining string from the first occurrence: %s\n", result+1);
+            strcpy(cfg_realm,result+1);
+        } else {
+            ast_debug(6,"ERROR: cfg_realm_arg substring not found but should have been!!\n");
+        }
+    }
+    else
+    {
+        ast_debug(6,"hidden digest_only substring in cfg_realm_arg not found. Copying arg.\n");
+        if(cfg_realm_arg[0] != '\0')
+            strcpy(cfg_realm,cfg_realm_arg);
+    }
+
+    return 0;
+}
+
+
+static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url,char *username,char *password,int isIPv6,int sip_enable, char *cfg_realm_arg, int sip_port)
+{
+
 	struct ast_frame *f = NULL;
      /*	struct ast_frame *sendFrame = NULL; OLD */
 	struct ast_frame sendFrame; /* PORT 17.5 make this a real ast_frame struct. No longer malloc. */
@@ -3535,6 +3600,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 	char *j;
 	char src[128];
 	int  res = 0;
+ 	int  rtsp_auth_fail_count = 0; /* Added v3.2 */
 
 	struct SDPContent* sdp = NULL;
 	struct SDPContent* sip_sdp = NULL; /* ADDED */
@@ -3553,16 +3619,22 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 	int elapsed = 0;
 	int ms = 10000;
 	int i = 0;
+	uint32_t rx_audio_count = 0; /* v3.2 add */
+	uint32_t rx_video_count = 0; /* v3.2 add */
+	uint32_t chan_wr_fail_count = 0; /* v3.2 add */
+
 	int temp; /* ADDED. SIP. */
 	int enable_sip_tx = 0; /* ADDED. SIP. */
 	uint16_t pre_enable_vf_tx_count = 0; /*ADDED. SIP */
 	uint16_t post_enable_vf_tx_count = 0; /*ADDED. SIP */
 	uint16_t sip_tx_error_count = 0; /*ADDED. SIP */
 	uint16_t sip_rx_audio_count = 0; /*[v3.0] catching rx sip audio (which shouldn't happen) */
+ 	int  sip_auth_fail_count = 0; /* Added v3.2 */
 	struct RtspPlayer *player;
 	struct RtpHeader *rtp;
 	struct RtpHeader *sip_rtp; /*ADDED. SIP */
 	uint32_t sip_prev_samples=0; /* ADDED. SIP */
+
 	struct Rtcp rtcp;
 	struct timeval tv = {0,0};
 	struct timeval rtcptv = {0,0};
@@ -3570,9 +3642,40 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 	struct RtspPlayer *sip_speaker = NULL;/* sip will make use of RTSP data structures */
 
 	/* log */
-	ast_log(LOG_NOTICE,"app_rtsp_sip version = %s\n", VERSION); /* added [3.1] */
-     /*	ast_log(LOG_WARNING,">rtsp_sip main loop\n");    was "rtsp play" */
 	ast_log(LOG_NOTICE,">rtsp-sip main loop\n");
+	ast_log(LOG_NOTICE,"app_rtsp_sip version = %s\n", VERSION); /* added [3.1] */
+
+        /* 
+	 * [v3.2] adds a scheme to request Digest Only authentication.
+         * This scheme looks at the call parameter cfg_realm_args string
+         * to see if it starts with "digest:" (case-insensitive)
+         * and if it does, it will set the skip_basic auth flag.
+         * This is only for rtsp Describe authentication as SIP is only using Digest auth.
+         */
+	char cfg_realm[256];
+	cfg_realm[0] = '\0';
+	int  skip_basic=0;
+
+	ast_debug(5,"cfg_realm_arg=%s\n",cfg_realm_arg);
+
+        parse_cfg_realm_arg(cfg_realm_arg, cfg_realm, &skip_basic);
+
+        ast_debug(5,"skip_basic=%d\n", skip_basic);
+        ast_debug(5,"cfg_realm=%s\n", cfg_realm);
+
+/* v3.2 add a way to test HikVision Auth header */
+#ifdef TEST_DESCR_AUTH_BUFF
+	char* test_buffer =
+    	"RTSP/1.0 401 Unauthorized\r\n"
+    	"CSeq: 1\r\n"
+    	"WWW-Authenticate: Digest realm=\"DS-022b77fb\", nonce=\"86645522ff43da0383d7bf095027f02c\", random=\"J8S7ET18EPUd9BoIP2CCtTPVI1ciEd/OhbPKhVib5v9MyBIxqWw2HnIYacChOMT1\", stale=\"FALSE\"\r\n"
+    	"WWW-Authenticate: Basic realm=\"DS-022b77fb\"\r\n"
+    	"Date:  Tue, Jan 27 2026 11:07:02 GMT\r\n"
+    	"\r\n";
+	int test_bufferLen = strlen(test_buffer);
+	strcpy(cfg_realm,"DS-022b77fb"); 
+
+#endif
 
 	/* Set random src for AST_FRAME debugging */
 	sprintf(src,"rtsp_play%08lx", ast_random());
@@ -3602,6 +3705,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 	}
 
 	/* Connect player */
+	ast_debug(3,"Connecting Up RTSP Player\n"); /* v3.2 add */
 	if (!RtspPlayerConnect(player,ip,rtsp_port,isIPv6,0))
 	{
 		/* log */
@@ -3612,6 +3716,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 
 	/* ADDED Connect sip speaker */
 	if(sip_enable){
+	        ast_debug(3,"Connecting Up SIP Player\n"); /* v3.2 add */
 		if (!RtspPlayerConnect(sip_speaker,ip,sip_port,isIPv6,1))
 		{
 			/* log */
@@ -3887,13 +3992,87 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 					/* Check unathorized */
 					if (responseCode==401)
 					{
-						/* Check athentication method */
+                                            /* 
+                                             * [v3.2] Add a way to bail out of the call when too many
+                                             *  rtsp Describe authentication attempts have been made.
+					     *    Dev note: to test auth fail count, uncomment line: password="wrong" below. 
+                                             */
+					    //password="wrong"; 
 
-                                                /* [v2.0]  Adding new way of detecting authentication method */
-					        ast_debug(3,"  describe 401 Processing\n");
+ 	                                    rtsp_auth_fail_count++; /* Note: count=1 is normal */
+
+			                    ast_debug(3,"  rtsp auth fail counts=%i\n", rtsp_auth_fail_count);
+                                            if (rtsp_auth_fail_count >=2 )
+                                            {
+						 ast_log(LOG_ERROR,"Authentication Failed for RTSP.\n");
+						 player->end = 1; // End
+						 break; // Exit 
+                                            }
+
+					    /* Check athentication method */
+                                            /* [v2.0]  Adding new way of detecting authentication method */
+					    ast_debug(3,"  describe 401 Processing\n");
+
+					    /* [v3.2] provide ability to skip Basic Auth */
+					    
+                                            if( skip_basic )
+                                            { 
+					            ast_debug(3,"    - RTSP: Skipping Basic Auth Method\n");
+						    ast_log(LOG_WARNING,"User Requested Digest Authentication only.\n");
+
+                                                    /* 
+						     * [v3.0] Add Digest Auth for RTSP 
+						     */
+					            ast_debug(3,"    - RTSP: Checking for Auth Method of Digest\n");
+  						   
+                                                    struct DigestAuthData digest_data;
+
+#ifdef TEST_DESCR_AUTH_BUFF
+                                                    if ( GetAuthSchemeDigest(test_buffer,test_bufferLen,&digest_data) == 0 )
+#else
+                                                    if ( GetAuthSchemeDigest(buffer,bufferLen,&digest_data) == 0 )
+#endif  						  
+                                                    {
+					            	ast_debug(3,"    - RTSP: Found Auth Method of Digest\n");
+			                           	strcpy(digest_data.uri,url);
+						   	char *method = "DESCRIBE";
+						   
+						   	ast_debug(5,"  Challenge Response Data- rx_realm: %s nonce: %s\
+						       			digest_data.uri %s algo: %s opaque: %s",\
+						       			digest_data.rx_realm, digest_data.nonce,digest_data.uri,\
+						        		digest_data.algorithm, digest_data.opaque); 
+                                                   
+						        // Create Digest authentication header 
+						    	RtspPlayerDigestAuthorization(player,username,\
+						   	  		password, cfg_realm,\
+                                                       			&digest_data, method, 0);
+                                                   
+						    	// Send again the describe 
+						    	RtspPlayerDescribe(player,url);
+						    	// Enter loop again
+						    	break;
+                                                    }
+                                                    else
+                                                    {
+					            	ast_debug(3,"    - RTSP: Skipped Basic/No Digest Method of Digest\n");
+						      /*ast_log(LOG_ERROR,"No Basic/Digest Authentication data found for RTSP\n");*/
+						   	ast_log(LOG_ERROR,"Digest Authentication Failed for RTSP.\n");
+
+						    	player->end = 1; // End
+						    	break; // Exit 
+                                                    }
+                                            } /* end skip basic */
+                                            else /* don't skip basic */
+                                            {
+
 					        ast_debug(3,"    - Checking for Auth Method of Basic\n");
                                                 struct BasicAuthData basic_data;
-                                                if (GetAuthSchemeBasic(buffer,bufferLen,&basic_data) == 0 )
+
+#ifdef TEST_DESCR_AUTH_BUFF
+                                                if ( GetAuthSchemeBasic(test_buffer,test_bufferLen,&basic_data) == 0 )
+#else
+                                                if ( GetAuthSchemeBasic(buffer,bufferLen,&basic_data) == 0 )
+#endif
                                                 {
 					            ast_debug(3,"    - Found Auth Method of Basic\n");
 
@@ -3907,15 +4086,17 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                 else
                                                 {
 					            ast_debug(3,"    - No Auth Method of Basic\n");
-                                                   
                                                     /* 
 						     * [v3.0] Add Digest Auth for RTSP 
 						     */
 					            ast_debug(3,"    - Checking for Auth Method of Digest\n");
   						   
                                                     struct DigestAuthData digest_data;
-  						   
-                                                    if (GetAuthSchemeDigest(buffer,bufferLen,&digest_data) == 0 )
+#ifdef TEST_DESCR_AUTH_BUFF
+                                                    if ( GetAuthSchemeDigest(test_buffer,test_bufferLen,&digest_data) == 0 )
+#else
+                                                    if ( GetAuthSchemeDigest(buffer,bufferLen,&digest_data) == 0 )
+#endif  						  
                                                     {
 					            	ast_debug(3,"    - Found Auth Method of Digest\n");
 			                           	strcpy(digest_data.uri,url);
@@ -3938,17 +4119,19 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                     }
                                                     else
                                                     {
-					            	ast_debug(3,"    - No Auth Method of Digest\n");
-						   	ast_log(LOG_ERROR,"No Basic/Digest Authentication data found for RTSP\n");
+					            	ast_debug(3,"    - RTSP: No Basic/Digest Method of Auth.\n");
+						      /*ast_log(LOG_ERROR,"No Basic/Digest Authentication data found for RTSP\n");*/
+						   	ast_log(LOG_ERROR,"Basic/Digest Authentication Failed for RTSP.\n");
 
 						    	player->end = 1; // End
 						    	break; // Exit 
                                                     }
  						   
-                                                }
+                                                } /* end if Basic else Digest Method*/
                                                     
-
-					}
+                                            } /*  end skip or not skip basic */
+                                            
+					}/* end Describe 401 processing */
 
 					/* On any other erro code */
 					if (responseCode<200 || responseCode>299)
@@ -3958,6 +4141,11 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 						/* Exit */
 						break;
 					}
+
+					/* 
+					 * Describe response code 200 processing 
+					 */
+ 	                                rtsp_auth_fail_count = 0; /* Added [v3.2]. Auth success so reset the Auth fail count */
 
 					/* If not reading content */
 					/* [v3.0] comment: message may actually have content, just not reading it yet. */
@@ -3990,6 +4178,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 
 						/* Move Message Body (data) to begining of buffer.*/
 						/* [v3] comment: bufferLen is now just the len of the Body/Content data */
+                                                /* memmove(void *to, const void *from, size_t numBytes) */
 				            /*	memcpy(buffer,buffer+responseLen,bufferLen); OLD BUGGY  */
 						memmove(buffer,buffer+responseLen,bufferLen);
 					}
@@ -4234,23 +4423,42 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 					/* Log formats */
 				   /*	ast_log(LOG_DEBUG,"-Set write format [%x,%x,%x]\n",\
 				    	 	audioFormat | videoFormat, audioFormat, videoFormat); OLD */
-					ast_debug(4,"-Set write format [%x,%x,%x]\n",\
-						audioFormat | videoFormat, audioFormat, videoFormat);
+				   /* ast_debug(4,"-Set write format [%x,%x,%x]\n",\
+						audioFormat | videoFormat, audioFormat, videoFormat); v3.2 Remove. Can't bit-or new format */
 
 					/* Set write format */
-					/* PORT 17.3 move ast_set_write_format further down and use new formats */
+					/* 
+					 * Original code used bitmaps for codec capability formats and simply bit-or'd all
+					 * the bits to come up with list of capability codecs used on a channel.  
+					 * Port 17.3 uses new formats, so can't do a bit or'ing so have to use new formats.
+					 *   PORT 17.3 moved ast_set_write_format further down and use new formats for a single codec. 
+					 * [v3.2] seems the ast_set_write_format() does an "appending" of the new formats
+					 *   so seems multiple calls to ast_set_write_format() for each new format will
+					 *   be the equivalent of the original code's bit-oring.
+					 */
 				     /*	ast_set_write_format(chan, audioFormat | videoFormat);	OLD. */ 
 
 					ast_debug(3, "-Set write format on channel %s:\n",ast_channel_name(chan)); /*ADD*/
+					/* v3.2 try adding both video and audio formats here */
+					if(audioNewFormat){ 
+						ast_debug(1, "  for %s\n ",ast_format_get_name(audioNewFormat)); /*ADD*/
+						if(ast_set_write_format(chan, audioNewFormat))
+						    ast_log(LOG_ERROR, "  Could not write format for %s\n ",ast_format_get_name(audioNewFormat)); 
+					}
+					if(videoNewFormat){ 
+						ast_debug(1, "  for %s\n ",ast_format_get_name(videoNewFormat)); /*ADD*/
+						if( ast_set_write_format(chan, videoNewFormat))
+						    ast_log(LOG_ERROR, "  Could not write format for %s\n ",ast_format_get_name(videoNewFormat));
+					}
 
 					/* if audio track */
-					if (audioControl)
+					if (audioControl) /* Note: There can also be video, but video will be done later */
 					{
-						/* Open audio */
-					        /* Set write format. PORT17.3 Moved from above to here */
-						ast_debug(1, "  for %s\n ",ast_format_get_name(audioNewFormat)); /*ADD*/
-						ast_set_write_format(chan, audioNewFormat);
+					        /* Set write format. PORT17.3 Moved from above to here. v3.2 moves this back to original location*/
+					      //ast_debug(1, "  for %s\n ",ast_format_get_name(audioNewFormat)); /*ADD*/
+					      //ast_set_write_format(chan, audioNewFormat);
 
+						/* Open audio */
 	                                        /* 
                                                  * [v3.0] Check if using digest auth.  If so, need to
                                                  *   update Auth Header (indicated by setting digest_data = NULL),
@@ -4263,15 +4471,28 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 			                                   password, cfg_realm, NULL, method, 0);
 					             ast_debug(5, "Updating method SETUP (for audio) for Digest Auth\n"); //Added [v3.0]
                                                 }
-
 						RtspPlayerSetupAudio(player,audioControl);
-					} else if (videoControl) {
-						/* Open video */
-						/* Set write format. PORT 17.3 Moved from above to here to use new format*/
+
+					} else if (videoControl) { /* Note: if true here, it means media is video only */
+						/* Set write format. PORT 17.3 Moved from above to here to use new format. v3.2 move back*/
 						/*ADD. if there is no compatible video format then skip write*/
 						if(videoNewFormat){ 
-							ast_debug(1, "  for %s\n ",ast_format_get_name(videoNewFormat)); /*ADD*/
-							ast_set_write_format(chan, videoNewFormat);
+						      //ast_debug(1, "  for %s\n ",ast_format_get_name(videoNewFormat)); /*ADD*/
+						      //ast_set_write_format(chan, videoNewFormat);
+
+						        /* Open video */
+	                                                /* 
+                                                 	 * [v3.2] Check if using digest auth.  If so, need to
+                                                 	 *   update Auth Header (indicated by setting digest_data = NULL),
+                                                 	 *   otherwise will likely get a 401 UnAuthorized response.
+                                                 	 *     Note: its also possible to get a 401 with Stale=TRUE anyway.
+                                                 	 */
+                                                	if (player->authorization !=NULL && player->digestdata !=NULL ){
+		                                     	char *method = "SETUP";
+		                                     	RtspPlayerDigestAuthorization(player,username,\
+			                                   	password, cfg_realm, NULL, method, 0);
+					             	ast_debug(5, "Updating method SETUP (for video only) for Digest Auth\n"); //Added [v3.2]
+                                                	}
 				 			RtspPlayerSetupVideo(player,videoControl);
 						}
 					} else {
@@ -4342,11 +4563,17 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 					if (videoControl){
 						/* Set up video */
 						/* ADD. If there is no compatible video format then skip video setup*/
-						if(videoNewFormat) 
+						if(videoNewFormat){  
+							/* 
+							 * v3.2 Assume SetupAudio was used already 
+							 * so don't need to check for digest auth here using a new method
+							 * as method=SETUP is already in use from prior SetupAudio
+							 */
 			 				RtspPlayerSetupVideo(player,videoControl);
+						}
 					}
 					else 
-					{
+					{	/* Looks like audio but no video, so start the PLAY */
 	                                        /* 
                                                  * [v3.0] Check if using digest auth.  If so, need to
                                                  *   update Auth Header (indicated by setting digest_data = NULL),
@@ -4569,6 +4796,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 			/* Depending on socket */
 			if (outfd==player->audioRtp) {
 				/* Set type */
+				rx_audio_count++;/* v3.2 add */
 			     /*	sendFrame->frametype = AST_FRAME_VOICE; OLD */
 				sendFrame.frametype = AST_FRAME_VOICE; /* PORT17.5 restructure sendFrame */
 
@@ -4597,6 +4825,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 			} else {
 				/* Set type */
 			     /*	sendFrame->frametype = AST_FRAME_VIDEO; OLD */
+				rx_video_count++;/* v3.2 add */
 				sendFrame.frametype = AST_FRAME_VIDEO;/* PORT 17.5 restructure sendFrame */
 
 				/* PORT 17.3.  Rework to accomodate the new media format 
@@ -4642,7 +4871,8 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 			sendFrame.mallocd = 0; /* PORT 17.5 restructure sendFrame */
 			/* Send frame */
 		     /*	ast_write(chan,sendFrame); OLD */
-			ast_write(chan,&sendFrame); /* PORT 17.5 restructure sendFrame */
+			if(ast_write(chan,&sendFrame) !=0) /* PORT 17.5 restructure sendFrame. v3.2 check for errors */
+	                    chan_wr_fail_count++; /* v3.2 add */
 
 			/* PORT17.3 ADD. Fix memory-leak. Free mem from strdup(src) */
 		     /*	ast_free((void*)sendFrame->src); PORT 17.5 No longer using strdup*/
@@ -4849,7 +5079,17 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
 								ast_log(LOG_ERROR,"SIP: 400 Bad Request. Not Processing.\n");
 								break;
 							case 401:
-					                       ast_debug(3,"  sip invite 401 processing\n");
+					                        ast_debug(3,"  sip invite 401 processing\n");
+
+								/* [v3.2] Add authorization fail counts and bail out if too many */
+ 	                                                        sip_auth_fail_count++; /* Note: count=1 is normal */
+			                    			ast_debug(3,"  sip auth fail counts=%i\n", sip_auth_fail_count);
+                                            			if (sip_auth_fail_count >=2 )
+                                            			{
+						 			ast_log(LOG_ERROR,"Authentication Failed for SIP.\n");
+						 			player->end = 1; // End
+						 			break; // Exit 
+                                            			}
 
                                                                 /* [v2.0]  Adding new way of detecting authentication method */
 					                        ast_debug(3,"    - Checking for Auth Method of Basic\n");
@@ -4859,9 +5099,9 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                                 if (GetAuthSchemeBasic(buffer,bufferLen,&basic_data) == 0 )
                                                                 {
 					                            ast_debug(3,"    - Found Auth Method of Basic\n");
-						                    ast_log(LOG_WARNING,"SIP Code does not yet support Basic Auth\n");
+						                    ast_log(LOG_WARNING,"SIP Code does not support Basic Auth\n");
                                                                 }
-                                                                else
+                                                                else 
                                                                 {
 					                            ast_debug(3,"    - No Auth Method of Basic\n");
 					                            ast_debug(3,"    - Checking for Auth Method of Digest\n");
@@ -4878,20 +5118,6 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                                                 digest_data.uri %s algo: %s opaque: %s",\
 										digest_data.rx_realm, digest_data.nonce,digest_data.uri,\
                                                                                 digest_data.algorithm, digest_data.opaque); 
-#ifdef OLDPLAYERDIGEST
-                                              
-									RtspPlayerDigestAuthorization(sip_speaker,username,\
-											password, cfg_realm,\
-											digest_data.nonce, \
-                                                                                        digest_data.nc, \
-                                                                                        digest_data.cnonce, \
-                                                                                        digest_data.qop, \
-                                                                                        digest_data.uri, \
-											digest_data.rx_realm, \
-                                                                                        method,\
-                                                                                        digest_data.algorithm, \
-                                                                                        digest_data.opaque, 1);
-#endif
 
 									RtspPlayerDigestAuthorization(sip_speaker,username,\
 											password, cfg_realm,\
@@ -4912,7 +5138,7 @@ static int main_loop(struct ast_channel *chan,char *ip, int rtsp_port, char *url
                                                                     else
                                                                     {
 					                                ast_debug(3,"    - No Auth Method of Digest\n");
-							                ast_log(LOG_ERROR,"No Basic/Digest Authentication header/data present\n");
+							                ast_log(LOG_ERROR,"SIP: No Basic/Digest Authentication header/data present\n");
                                                                     }
                                                                 }
 
@@ -5197,7 +5423,8 @@ rstp_play_stop:
 
 	if (sip_sdp && sip_enable)
 		DestroySDP(sip_sdp);
-	ast_debug(3,"-sip tx vf count pre:%i post:%i error:%i\n",pre_enable_vf_tx_count,post_enable_vf_tx_count,sip_tx_error_count);
+	ast_debug(3,"-rtsp counts: rx audio pkts:%"PRIu32" rx video pkts:%"PRIu32" channel wr fails:%"PRIu32"\n",rx_audio_count, rx_video_count, chan_wr_fail_count); /* v3.2 add */
+        ast_debug(3,"-sip  tx audio count pre:%i post:%i error:%i\n",pre_enable_vf_tx_count,post_enable_vf_tx_count,sip_tx_error_count);
 	/*
 	 * PORT 17.5 restructure sendFrame. No longer malloc'd */
 	/* Free frame */
@@ -5417,7 +5644,7 @@ static int app_rtsp_sip(struct ast_channel *chan, const char *data) /* PORT 17.3
 	int  isIPv6=0;
 
 	int sip_enable;
-	char *cfg_realm;
+	char *cfg_realm_arg;
 	int sip_port;
 
 
@@ -5434,24 +5661,26 @@ static int app_rtsp_sip(struct ast_channel *chan, const char *data) /* PORT 17.3
 	AST_DECLARE_APP_ARGS(args,
 		AST_APP_ARG(rtsp_uri);
 		AST_APP_ARG(sip_enable);
-		AST_APP_ARG(cfg_realm);
+		AST_APP_ARG(cfg_realm_arg); /* [v3.2] change cfg_realm to cfg_realm_arg */
 		AST_APP_ARG(sip_port);
 	);
 	parse = ast_strdupa(data ?: "");
 	AST_STANDARD_APP_ARGS(args, parse);
 
-	ast_debug(3,"ARGs: RTSP URI: %s. CFG Realm: %s SIP Listen Port: %s\n",args.rtsp_uri,args.cfg_realm,args.sip_port); /*tjl*/
+	ast_debug(3,"ARGs: RTSP URI: %s. CFG Realm: %s SIP Listen Port: %s\n",args.rtsp_uri,args.cfg_realm_arg,args.sip_port); /*tjl*/
 
 	/* [17.x NEW]. See if there are any args for sip realm */
-	if(!args.cfg_realm)
+      //if(!args.cfg_realm_arg) 
+	if(!args.sip_enable) /* v3.2 bug fix. */
 		sip_enable = 0; 
 	else
 		sip_enable = atoi(args.sip_enable);
 
-	if(!args.cfg_realm)
-		cfg_realm = "None"; 
+        /* [v3.2] change cfg_realm to cfg_realm_arg  in support of hidden digest_only feature.*/
+	if(!args.cfg_realm_arg)
+		cfg_realm_arg = "None"; 
 	else
-		cfg_realm = args.cfg_realm;
+		cfg_realm_arg = args.cfg_realm_arg;
 
 	/* [17.x NEW]. See if there are any args for sip port */
 	if(!args.sip_port)
@@ -5544,7 +5773,7 @@ static int app_rtsp_sip(struct ast_channel *chan, const char *data) /* PORT 17.3
 		}
 	}
 
-	ast_debug(3,"IP: %s RTSP port: %i Username: %s Passwd: %s URL_Path: %s isIPv6: %i, SIP Enable: %i, CFG Realm: %s, port: %i\n",ip,rtsp_port,username,password,url,isIPv6,sip_enable, cfg_realm,sip_port);
+	ast_debug(3,"IP: %s RTSP port: %i Username: %s Passwd: %s URL_Path: %s isIPv6: %i, SIP Enable: %i, CFG Realm: %s, port: %i\n",ip,rtsp_port,username,password,url,isIPv6,sip_enable, cfg_realm_arg,sip_port);
 
 	/* 
 	 * PORT17.3
@@ -5572,7 +5801,7 @@ static int app_rtsp_sip(struct ast_channel *chan, const char *data) /* PORT 17.3
 			/* Default */
 			rtsp_port = 554;
 		/* Play */
-		res = main_loop(chan,ip,rtsp_port,url,username,password,isIPv6,sip_enable,cfg_realm,sip_port); /* name change */
+		res = main_loop(chan,ip,rtsp_port,url,username,password,isIPv6,sip_enable,cfg_realm_arg,sip_port); /* name change */
 
 	} else
 		ast_log(LOG_ERROR,"RTSP ERROR: Unknown protocol in rtsp uri %s\n",uri);

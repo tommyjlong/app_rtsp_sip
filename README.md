@@ -3,7 +3,7 @@ In short, an Asterisk calling entity can use this Asterisk app to establish two-
 
 app_rtsp_sip.c is an [Asterisk](https://www.asterisk.org/) application tailored for connecting the audio streams of a Vivotek based IP camera to an Asterisk Channel.  The code was originally `app_rtsp.c` developed by Sergio Garcia Murillo. `app_rtsp.c` acted as an RTSP client/player which could setup an RTSP connection to an endpoint implementing an RTSP Server (such as that embedded inside a camera) and play the audio and video streams from the RTSP Server into a "calling" Asterisk channel.  In this manner, `app_rtsp` itself acted as an endpoint of an Asterisk Channel.
 
-`app_rtsp_sip` has updated the `app_rtsp` code to compile and run on more modern versions of Asterisk, PLUS it has added a simple SIP UA capability for setting up a SIP Session and subsequently sending RTP audio from the same Asterisk channel to the same camera.  In short, an Asterisk calling entity can establish two-way audio with a surveillance camera. If only RTSP is needed, the `app_rtsp_sip` application can be setup in Asterisk to only use RTSP.
+`app_rtsp_sip` has updated the `app_rtsp` code to compile and run on more modern versions of Asterisk, PLUS it has added a simple SIP UA capability for setting up a SIP Session and subsequently sending RTP audio from the same Asterisk channel to the same camera.  In short, an Asterisk calling entity can establish two-way audio with a surveillance camera. If only RTSP is needed, the `app_rtsp_sip` application can be setup in Asterisk to only use RTSP.    
 
 In-line documentation was added to app_rtsp_sip.c so that one can view its documentation at the Asterisk command line.
 
@@ -11,12 +11,12 @@ In-line documentation was added to app_rtsp_sip.c so that one can view its docum
 - `app_rtsp_sip` has been developed and tested on a couple of Vivotek Cameras, as well as a Vivint Video Doorbell running Vivotek software that was configured for local use with Home Assistant.  It is possible that `app_rtsp_sip` may work with other cameras/devices but it is left up to the user of this software to determine how best to work with this code for such devices.
 - Digest authentication uses hashing code that may not work on certain cpu architectures possibly those running Big Endian (but not tested).
 
-The RTSP portion of the code originially developed by Sergio Garcia Murillo and that has been ported to more modern versions of Asterisk has not been tested for the following:
-- RTSP Video
-- IPv6
-- RTSP Tunnel
-- Use DTMF to stop RTSP
-
+- The RTSP portion of the code originially developed by Sergio Garcia Murillo and that has been ported to more modern versions of Asterisk has not been tested for the following:
+  - RTSP Video
+  - IPv6
+  - RTSP Tunnel
+  - Use DTMF to stop RTSP
+- Some cameras that advertise to app_rtsp_sip that they support "Basic" authentication may not actually support it.  app_rtsp_sip gives preference to Basic authentication for RTSP and thus will not try Digest Authentication if Basic is available.  To overcome this situation, a feature is available to have app_rtsp_sip only try "Digest" authentication.
 # Asterisk
 
 ## Building Asterisk
@@ -152,10 +152,13 @@ When you call extension 101, Asterisk will use the context `from-internal` to An
 - `554` is the RTSP port number, which is the default.
 - `live.sdp` is the portion of the URL that is used by the camera for establishing RTSP to a particular stream on the camera.  This is the often used value for Vivotek cameras, but there are others such as `live1s1.sdp` `live1s2.sdp` and `live1s3.sdp` that are also used by Vivotek cameras. Check the camera's web server for "System Parameters" along with the "Media" settings for the various "streams" (1 or 2 or 3).
 - `1` indicates that SIP is to be used.  If you only want to use RTSP and not both RTSP and SIP, then set this to 0.
-- `streaming_server` is the realm used for digest authentication.  This is the default for Vivotek cameras. It is optional, and if not used, then one can simply supply a null parameter using `,,` instead of `,streaming_server,`.
+- `streaming_server` is the configured realm used for "Digest" authentication.  This is the default realm for Vivotek cameras. It is optional, and if not used, then one can simply supply a null parameter using `,,` instead of `,streaming_server,`.  If it is used, then it must match the realm advertised by the camera to app_rtsp_sip. In the case of RTSP, if "Basic" Authentication is also advertised, Basic will be tried in lieu of Digest, but if one only wants to use Digest authentication, then prepend the configured realm with the string `Digest_only:` (case insensitive).  Here are some examples:
+  - `,Digest_only:,` when not using a configured realm,
+  - `,Digest_only:streaming_server,` when using a configured realm.
 - `5060` is the SIP port number, which is the default.
 
-The app_rtsp_sip application is not expected to hangup by itself, but instead will wait for the calling party to hangup.
+The app_rtsp_sip application is not expected to hangup by itself, but instead will wait for the calling party to hangup.  
+  - It should be noted, that when the calling party hangs up, app_rtsp_sip usually will get an error trying to read data from the Asterisk channel and throw a log message (which can be ignored).
 
 
 If you don't have a calling endpoint setup, here is an example using [ZoIPer](https://www.zoiper.com/softphone) softphone SIP client (which you can run on windows, iOS, etc) where here it is setup with phone extension number 6001.
@@ -266,6 +269,12 @@ description: "Setup the debug logging levels for app_rtsp_sip"
 ```
 Then place a call to the device using app_rtsp_sip.  The file `full.txt` should contain several DEBUG lines for app_rtsp_sip.
 # History
+- version 3.2
+  - Bug Fixes for Authentication
+  - Change - Don't continuously retry RTSP DESCRIBE or SIP INVITE failed authentication attempts. After a couple of failures, end the call.
+  - Feature Add - A way for the user to request that Basic authentication be skipped and only do Digest authentication by prepending the string `digest_only:` to the configured realm. 
+  - Adder - More packet counters and channel write fail counters that are presented in the logs at the end of the call.
+  - Adder - Debug to indicate which tcp/udp ports are being used.
 - version 3.1
   - Delays the start of SIP until after the camera has OK'd the PLAYing of video/audio.  This seems to fix the problem where some cameras would send audio over the SIP established audio socket instead of the audio socket setup by RTSP.
 - version 3.0
@@ -280,5 +289,4 @@ Then place a call to the device using app_rtsp_sip.  The file `full.txt` should 
 - version 1.0 Ported the original app_rtsp.c code to Asterisk version 17.x and add a SIP client to call the camera for setting up a audio channel to the camera.
 # Credits
 - Sergio Garcia Murillo, the author of the original app_rtsp.c code.
-
 
